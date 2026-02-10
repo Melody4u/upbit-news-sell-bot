@@ -266,7 +266,7 @@ def place_order_with_retry(action_name: str, fn, *args, retries: int = 3, delay_
     raise RuntimeError(f"{action_name} failed after retries: {last_err}")
 
 
-def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, float]) -> Tuple[int, List[str], Dict[str, float]]:
+def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, float], mtf_trend_ok: bool = True) -> Tuple[int, List[str], Dict[str, float]]:
     close = df["close"]
     open_ = df["open"]
     high = df["high"]
@@ -285,6 +285,7 @@ def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, floa
 
     ma20 = close.rolling(int(cfg["MA_SHORT"])).mean()
     ma200 = close.rolling(int(cfg["MA_LONG"])).mean()
+    vwma100 = (close * vol).rolling(int(cfg["VWMA_PERIOD"])).sum() / vol.rolling(int(cfg["VWMA_PERIOD"])).sum()
 
     score = 0
     reasons: List[str] = []
@@ -344,7 +345,21 @@ def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, floa
         buy_score += 2
         buy_reasons.append("trend_up_above_ma20_ma200")
 
+    if pd.notna(vwma100.iloc[-1]) and current >= float(vwma100.iloc[-1]):
+        buy_score += 1
+        buy_reasons.append("price_above_vwma100")
+    elif pd.notna(vwma100.iloc[-1]) and current < float(vwma100.iloc[-1]):
+        score += 1
+        reasons.append("price_below_vwma100")
+
     # ?〓낫???꾪꽣
+    if mtf_trend_ok:
+        buy_score += 1
+        buy_reasons.append("mtf_trend_ok")
+    else:
+        buy_score = max(0, buy_score - 2)
+        buy_reasons.append("mtf_trend_block")
+
     cross_series = (ma20 > ma200).astype("float").diff().abs()
     recent_crosses = int(cross_series.tail(int(cfg["SIDEWAYS_LOOKBACK"])).fillna(0).sum())
     sideways = recent_crosses >= int(cfg["SIDEWAYS_CROSS_THRESHOLD"])
@@ -401,6 +416,7 @@ def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, floa
         "ema_slow": float(ema_slow.iloc[-1]),
         "ma20": float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else 0.0,
         "ma200": float(ma200.iloc[-1]) if pd.notna(ma200.iloc[-1]) else 0.0,
+        "vwma100": float(vwma100.iloc[-1]) if pd.notna(vwma100.iloc[-1]) else 0.0,
         "ma200_slope": ma200_slope,
         "ma_gap_pct": ma_gap_ratio * 100,
         "recent_crosses": recent_crosses,
@@ -447,6 +463,10 @@ def run():
     entry_mode = os.getenv("ENTRY_MODE", "confirm_breakout")
     probe_entry_ratio = get_env_float("PROBE_ENTRY_RATIO", 0.15)
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
+    mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute240")
+    mtf_lookback = get_env_int("MTF_TREND_LOOKBACK", 120)
+    rr_min = get_env_float("MIN_RR", 2.5)
+    rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
     stop_by_entry_candle = env_bool("STOP_BY_ENTRY_CANDLE", True)
     take_profit_by_ma22 = env_bool("TAKE_PROFIT_BY_MA22", True)
     ma_exit_period = get_env_int("MA_EXIT_PERIOD", 22)
@@ -473,6 +493,7 @@ def run():
         "RSI_OVERSOLD": get_env_float("RSI_OVERSOLD", 30),
         "VOL_PERIOD": get_env_int("VOL_PERIOD", 20),
         "VOL_SPIKE_MULT": get_env_float("VOL_SPIKE_MULT", 1.8),
+        "VWMA_PERIOD": get_env_int("VWMA_PERIOD", 100),
         "LOSS_CUT_PCT": get_env_float("LOSS_CUT_PCT", 0.02),
         "MA_SHORT": get_env_int("MA_SHORT", 20),
         "MA_LONG": get_env_int("MA_LONG", 200),
@@ -566,7 +587,20 @@ def run():
                 time.sleep(check_seconds)
                 continue
 
-            signal_score, signal_reasons, metrics = evaluate_signals(df, avg_buy_price, cfg)
+            df_mtf = pyupbit.get_ohlcv(market, interval=mtf_interval, count=max(mtf_lookback, 220))
+            mtf_trend_ok = True
+            if df_mtf is not None and len(df_mtf) >= 80:
+                mtf_close = df_mtf["close"]
+                mtf_ma50 = mtf_close.rolling(50).mean()
+                mtf_ma200 = mtf_close.rolling(200).mean()
+                mtf_trend_ok = bool(
+                    pd.notna(mtf_ma50.iloc[-1])
+                    and pd.notna(mtf_ma200.iloc[-1])
+                    and float(mtf_ma50.iloc[-1]) > float(mtf_ma200.iloc[-1])
+                    and float(mtf_close.iloc[-1]) > float(mtf_ma50.iloc[-1])
+                )
+
+            signal_score, signal_reasons, metrics = evaluate_signals(df, avg_buy_price, cfg, mtf_trend_ok=mtf_trend_ok)
             buy_score = int(metrics.get("buy_score", 0))
             buy_reasons = list(metrics.get("buy_reasons", []))
 
@@ -627,7 +661,19 @@ def run():
             if entry_mode == "confirm_breakout" and not box_breakout_long:
                 should_buy = False
 
-            # 吏꾩엯遊?????먯젅
+            # 손익비(R:R) 필터
+            rr_value = None
+            stop_price = min(last_low, metrics["ma20"] if metrics["ma20"] > 0 else last_low)
+            target_price = max(recent_high_prev, last_close + (atr_now * rr_target_atr_mult))
+            risk_per_unit = max(0.0, last_close - stop_price)
+            reward_per_unit = max(0.0, target_price - last_close)
+            if risk_per_unit > 0:
+                rr_value = reward_per_unit / risk_per_unit
+            if should_buy and (rr_value is None or rr_value < rr_min):
+                should_buy = False
+                buy_reasons.append(f"rr_block(rr={0 if rr_value is None else rr_value:.2f}<{rr_min:.2f})")
+
+            # 진입봉 저점 이탈 손절
             if stop_by_entry_candle and coin_balance > 0 and last_buy_stop_price is not None and current_price < last_buy_stop_price:
                 should_sell = True
                 signal_reasons.append(f"entry_candle_stop({last_buy_stop_price:.0f})")
@@ -639,10 +685,12 @@ def run():
                 signal_reasons.append(f"ma{ma_exit_period}_exit")
 
             logging.info(
-                "tick | mode=%s risk=%.1f(%s) price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
+                "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
                 risk_mode,
                 risk_score,
                 risk_source,
+                int(mtf_trend_ok),
+                -1.0 if rr_value is None else rr_value,
                 current_price,
                 coin_value_krw,
                 krw_balance,
@@ -654,6 +702,7 @@ def run():
                 int(box_breakout_long),
                 metrics["ma20"],
                 metrics["ma200"],
+                metrics["vwma100"],
                 metrics["ma_gap_pct"],
                 metrics["adx"],
                 metrics["rsi"],
