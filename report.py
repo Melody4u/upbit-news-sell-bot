@@ -37,13 +37,13 @@ def summarize(rows):
     tips = []
     top = [x for x, _ in reason_counter.most_common(3)]
     if any("entry_candle_stop" in t for t in top):
-        tips.append("吏꾩엯 怨쇰? 媛?μ꽦: PROBE_ENTRY_RATIO瑜???텛怨?BREAKOUT_BODY_ATR_MULT瑜??믪씠湲?)
+        tips.append("진입 직후 손절 빈도 높음: PROBE_ENTRY_RATIO를 낮추거나 BREAKOUT_BODY_ATR_MULT를 높여보세요")
     if any("sideways_filter" in t for t in top):
-        tips.append("?〓낫 怨쇰ℓ留?媛?μ꽦: SIDEWAYS_CROSS_THRESHOLD ?곹뼢, BOX_LOOKBACK ?뺣?")
+        tips.append("횡보 구간 거래 과다 가능성: SIDEWAYS_CROSS_THRESHOLD 상향, BOX_LOOKBACK 조정")
     if any("ma22_exit" in t or "ma22" in t for t in top):
-        tips.append("泥?궛 怨쇰? 媛?μ꽦: MA_EXIT_PERIOD 22->24~30 ?뚯뒪??)
+        tips.append("청산이 너무 빠를 수 있음: MA_EXIT_PERIOD를 22 -> 24~30 범위로 테스트")
     if not tips:
-        tips.append("理쒓렐 濡쒓렇 湲곗? ?뚮씪誘명꽣 1媛쒖뵫留??뚰룺 議곗젙?섎ŉ 鍮꾧탳")
+        tips.append("최근 로그 기준으로 파라미터 1개씩만 조정하고 결과를 비교하세요")
 
     return {
         "count": len(rows),
