@@ -550,6 +550,11 @@ def run():
     post_entry_cooldown_bars = get_env_int("POST_ENTRY_COOLDOWN_BARS", 3)
     partial_tp_levels = parse_float_list_csv(os.getenv("PARTIAL_TP_LEVELS", "1.0,2.0"), [1.0, 2.0])
     partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.3,0.3"), [0.3, 0.3])
+    if len(partial_tp_levels) != len(partial_tp_ratios):
+        logging.warning("PARTIAL_TP length mismatch | levels=%s ratios=%s -> truncating to min length", len(partial_tp_levels), len(partial_tp_ratios))
+    n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
+    partial_tp_levels = partial_tp_levels[:n_tp]
+    partial_tp_ratios = partial_tp_ratios[:n_tp]
     stop_by_entry_candle = env_bool("STOP_BY_ENTRY_CANDLE", True)
     take_profit_by_ma22 = env_bool("TAKE_PROFIT_BY_MA22", True)
     ma_exit_period = get_env_int("MA_EXIT_PERIOD", 22)
@@ -942,16 +947,31 @@ def run():
                                 "reasons": [f"partial_tp_{lvl:.2f}R"],
                                 "dry_run": dry_run,
                             })
+                            filled_tp = False
                             if dry_run:
                                 last_action_ts = now_ts
                                 last_signal_hash = make_signal_hash("sell_partial", [f"partial_tp_{lvl:.2f}R"], int(signal_score), market)
+                                filled_tp = True
                             else:
+                                before_coin, before_krw = coin_balance, krw_balance
                                 notify_event(alert_webhook_url, alert_events, "order_sent", f"sell_partial sent {market} ratio={ratio:.2f}")
                                 result = place_order_with_retry("sell_partial_market_order", upbit.sell_market_order, market, tp_coin)
                                 logging.warning("sell_partial result: %s", result)
-                            partial_tp_done.add(key)
-                            runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
-                            partial_tp_executed = True
+                                order_uuid = result.get("uuid") if isinstance(result, dict) else None
+                                if order_uuid:
+                                    pending_order = {"uuid": order_uuid, "side": "sell_partial", "created_ts": now_ts}
+                                time.sleep(1.0)
+                                after_coin, _, _ = get_account_state(upbit, market)
+                                after_krw = get_krw_balance(upbit)
+                                filled_tp = verify_position_change(before_coin, before_krw, after_coin, after_krw, "sell")
+                                logging.warning("sell_partial fill check | filled=%s before_coin=%.8f after_coin=%.8f", filled_tp, before_coin, after_coin)
+                                if filled_tp:
+                                    pending_order = None
+                                    notify_event(alert_webhook_url, alert_events, "filled", f"sell_partial filled {market} level={lvl:.2f}R")
+                            if filled_tp:
+                                partial_tp_done.add(key)
+                                runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                                partial_tp_executed = True
                         break
 
             if partial_tp_executed:
