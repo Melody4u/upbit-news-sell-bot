@@ -55,6 +55,7 @@ python dashboard.py
 - 슬리피지 가드(`MAX_SLIPPAGE_BPS`) 및 추가 Kill-switch(`MAX_DAILY_LOSS_PCT`, `MAX_TRADES_PER_DAY`, `MAX_POSITION_KRW`)
 - 체결 품질 필터: 스프레드 상한(`SPREAD_BPS_MAX`) + 진입 후 봉 쿨다운(`POST_ENTRY_COOLDOWN_BARS`)
 - 분할 익절: `PARTIAL_TP_LEVELS` / `PARTIAL_TP_RATIOS` 기반 단계적 부분청산
+- ATR 레짐 필터(`ATR_REGIME_MIN_PCT`, `ATR_REGIME_MAX_PCT`) + 잔여물량 트레일링 스탑(`TRAILING_*`)
 - 운영 알림 웹훅(`ALERT_WEBHOOK_URL`, `ALERT_EVENTS`)
 - 브레이크아웃 게이트 결합 방식 파라미터화(`BREAKOUT_GATE_MODE=and|or`)
 - EMA/ADX, Donchian, ATR, RSI, 거래량 보조 시그널

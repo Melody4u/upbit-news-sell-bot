@@ -262,6 +262,7 @@ def load_runtime_state(path: str) -> Dict:
         "last_buy_stop_price": None,
         "last_buy_ts": 0.0,
         "partial_tp_done": [],
+        "trailing_peak_price": 0.0,
         "day_key": time.strftime("%Y-%m-%d"),
         "day_start_equity": 0.0,
         "trades_today": 0,
@@ -555,6 +556,11 @@ def run():
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
     partial_tp_levels = partial_tp_levels[:n_tp]
     partial_tp_ratios = partial_tp_ratios[:n_tp]
+    atr_regime_min_pct = get_env_float("ATR_REGIME_MIN_PCT", 0.6)
+    atr_regime_max_pct = get_env_float("ATR_REGIME_MAX_PCT", 4.0)
+    trailing_stop_mode = os.getenv("TRAILING_STOP_MODE", "atr").lower()
+    trailing_atr_mult = get_env_float("TRAILING_ATR_MULT", 2.5)
+    trailing_apply_to_remainder_only = env_bool("TRAILING_APPLY_TO_REMAINDER_ONLY", True)
     stop_by_entry_candle = env_bool("STOP_BY_ENTRY_CANDLE", True)
     take_profit_by_ma22 = env_bool("TAKE_PROFIT_BY_MA22", True)
     ma_exit_period = get_env_int("MA_EXIT_PERIOD", 22)
@@ -629,6 +635,7 @@ def run():
             last_buy_stop_price = None
     last_buy_ts = float(runtime_state.get("last_buy_ts", 0.0) or 0.0)
     partial_tp_done = set(str(x) for x in (runtime_state.get("partial_tp_done") or []))
+    trailing_peak_price = float(runtime_state.get("trailing_peak_price", 0.0) or 0.0)
     prev_halted = bool(runtime_state.get("halted", False))
 
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
@@ -706,6 +713,7 @@ def run():
             runtime_state["last_buy_stop_price"] = last_buy_stop_price
             runtime_state["last_buy_ts"] = float(last_buy_ts)
             runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+            runtime_state["trailing_peak_price"] = float(trailing_peak_price)
             save_runtime_state(runtime_state_path, runtime_state)
 
             if runtime_state.get("halted", False):
@@ -722,6 +730,7 @@ def run():
             if coin_balance <= 0:
                 last_buy_stop_price = None
                 last_buy_ts = 0.0
+                trailing_peak_price = 0.0
                 partial_tp_done = set()
                 active_box_high = None
                 addon_done = False
@@ -825,6 +834,12 @@ def run():
                 should_buy = False
                 buy_reasons.append(f"rr_block(rr={0 if rr_value is None else rr_value:.2f}<{rr_min:.2f})")
 
+            # ATR 변동성 레짐 필터
+            atr_pct = (atr_now / max(current_price, 1e-9)) * 100.0
+            if should_buy and (atr_pct < atr_regime_min_pct or atr_pct > atr_regime_max_pct):
+                should_buy = False
+                buy_reasons.append(f"atr_regime_block({atr_pct:.2f}%)")
+
             # 스프레드 필터 + 진입 후 봉 쿨다운
             spread_bps = get_spread_bps(market)
             if should_buy and spread_bps_max > 0 and spread_bps > spread_bps_max:
@@ -867,6 +882,18 @@ def run():
                 emergency_sell = True
                 signal_reasons.append(f"ma{ma_exit_period}_exit")
 
+            # 잔여 물량 트레일링 스탑
+            if coin_balance > 0:
+                trailing_peak_price = max(trailing_peak_price, current_price)
+                apply_trailing = True
+                if trailing_apply_to_remainder_only and len(partial_tp_done) == 0:
+                    apply_trailing = False
+                if apply_trailing and trailing_stop_mode == "atr":
+                    trailing_stop_price = trailing_peak_price - (atr_now * trailing_atr_mult)
+                    if current_price < trailing_stop_price:
+                        should_sell = True
+                        signal_reasons.append(f"trailing_atr_stop({trailing_stop_price:.0f})")
+
             # 최종 멱등성 게이트 재적용 (긴급 청산 bypass 옵션)
             if should_sell or should_buy:
                 final_side = "sell" if should_sell else "buy"
@@ -899,12 +926,13 @@ def run():
                 buy_reasons.append(f"max_position_block({max_position_krw:.0f})")
 
             logging.info(
-                "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f spread=%.1fbps price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
+                "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f atr=%.2f%% spread=%.1fbps price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
                 risk_mode,
                 risk_score,
                 risk_source,
                 int(mtf_trend_ok),
                 -1.0 if rr_value is None else rr_value,
+                atr_pct,
                 spread_bps,
                 current_price,
                 coin_value_krw,
@@ -981,6 +1009,7 @@ def run():
                 runtime_state["last_buy_stop_price"] = last_buy_stop_price
                 runtime_state["last_buy_ts"] = float(last_buy_ts)
                 runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+                runtime_state["trailing_peak_price"] = float(trailing_peak_price)
                 save_runtime_state(runtime_state_path, runtime_state)
                 time.sleep(check_seconds)
                 continue
@@ -1059,6 +1088,7 @@ def run():
                         last_action_ts = now_ts
                         last_signal_hash = signal_hash
                         last_buy_ts = now_ts
+                        trailing_peak_price = current_price
                         partial_tp_done = set()
                         runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         if stop_by_entry_candle:
@@ -1079,6 +1109,7 @@ def run():
                             last_action_ts = now_ts
                             last_signal_hash = signal_hash
                             last_buy_ts = now_ts
+                            trailing_peak_price = current_price
                             partial_tp_done = set()
                             runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                             notify_event(alert_webhook_url, alert_events, "filled", f"buy filled {market} price={current_price:.0f}")
@@ -1119,6 +1150,7 @@ def run():
             runtime_state["last_buy_stop_price"] = last_buy_stop_price
             runtime_state["last_buy_ts"] = float(last_buy_ts)
             runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+            runtime_state["trailing_peak_price"] = float(trailing_peak_price)
             save_runtime_state(runtime_state_path, runtime_state)
 
             time.sleep(check_seconds)
