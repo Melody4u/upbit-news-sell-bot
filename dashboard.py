@@ -272,5 +272,14 @@ def api_account():
 
 
 if __name__ == "__main__":
+    import threading
+    import webbrowser
+
     port = int(os.getenv("DASHBOARD_PORT", "8787"))
+    auto_open = os.getenv("DASHBOARD_AUTO_OPEN", "true").lower() in ("1", "true", "yes", "y")
+    url = f"http://127.0.0.1:{port}"
+
+    if auto_open:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
     app.run(host="127.0.0.1", port=port, debug=False)
