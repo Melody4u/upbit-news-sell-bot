@@ -161,6 +161,34 @@ def get_krw_balance(upbit) -> float:
     return float(krw or 0)
 
 
+def get_spread_bps(market: str) -> float:
+    try:
+        ob = pyupbit.get_orderbook(market)
+        if isinstance(ob, list):
+            ob = ob[0] if ob else None
+        if not ob:
+            return 0.0
+        units = ob.get("orderbook_units", [])
+        if not units:
+            return 0.0
+        ask = float(units[0].get("ask_price") or 0)
+        bid = float(units[0].get("bid_price") or 0)
+        mid = (ask + bid) / 2 if (ask > 0 and bid > 0) else 0
+        if mid <= 0:
+            return 0.0
+        return ((ask - bid) / mid) * 10000
+    except Exception:
+        return 0.0
+
+
+def parse_float_list_csv(s: str, default: List[float]) -> List[float]:
+    try:
+        vals = [float(x.strip()) for x in (s or "").split(",") if x.strip()]
+        return vals if vals else default
+    except Exception:
+        return default
+
+
 def build_stop_feedback(reasons: List[str]) -> str:
     text = " | ".join(reasons)
     tips = []
@@ -232,6 +260,8 @@ def load_runtime_state(path: str) -> Dict:
         "last_signal_hash": "",
         "pending_order": None,
         "last_buy_stop_price": None,
+        "last_buy_ts": 0.0,
+        "partial_tp_done": [],
         "day_key": time.strftime("%Y-%m-%d"),
         "day_start_equity": 0.0,
         "trades_today": 0,
@@ -516,6 +546,10 @@ def run():
     mtf_lookback = get_env_int("MTF_TREND_LOOKBACK", 120)
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
+    spread_bps_max = get_env_float("SPREAD_BPS_MAX", 12)
+    post_entry_cooldown_bars = get_env_int("POST_ENTRY_COOLDOWN_BARS", 3)
+    partial_tp_levels = parse_float_list_csv(os.getenv("PARTIAL_TP_LEVELS", "1.0,2.0"), [1.0, 2.0])
+    partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.3,0.3"), [0.3, 0.3])
     stop_by_entry_candle = env_bool("STOP_BY_ENTRY_CANDLE", True)
     take_profit_by_ma22 = env_bool("TAKE_PROFIT_BY_MA22", True)
     ma_exit_period = get_env_int("MA_EXIT_PERIOD", 22)
@@ -588,6 +622,8 @@ def run():
             last_buy_stop_price = float(last_buy_stop_price)
         except Exception:
             last_buy_stop_price = None
+    last_buy_ts = float(runtime_state.get("last_buy_ts", 0.0) or 0.0)
+    partial_tp_done = set(str(x) for x in (runtime_state.get("partial_tp_done") or []))
     prev_halted = bool(runtime_state.get("halted", False))
 
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
@@ -663,6 +699,8 @@ def run():
             runtime_state["last_signal_hash"] = last_signal_hash
             runtime_state["pending_order"] = pending_order
             runtime_state["last_buy_stop_price"] = last_buy_stop_price
+            runtime_state["last_buy_ts"] = float(last_buy_ts)
+            runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
             save_runtime_state(runtime_state_path, runtime_state)
 
             if runtime_state.get("halted", False):
@@ -678,6 +716,8 @@ def run():
 
             if coin_balance <= 0:
                 last_buy_stop_price = None
+                last_buy_ts = 0.0
+                partial_tp_done = set()
                 active_box_high = None
                 addon_done = False
 
@@ -780,6 +820,17 @@ def run():
                 should_buy = False
                 buy_reasons.append(f"rr_block(rr={0 if rr_value is None else rr_value:.2f}<{rr_min:.2f})")
 
+            # 스프레드 필터 + 진입 후 봉 쿨다운
+            spread_bps = get_spread_bps(market)
+            if should_buy and spread_bps_max > 0 and spread_bps > spread_bps_max:
+                should_buy = False
+                buy_reasons.append(f"spread_block({spread_bps:.1f}>{spread_bps_max:.1f})")
+
+            entry_cooldown_sec = max(0, post_entry_cooldown_bars) * 3600
+            if should_buy and last_buy_ts > 0 and (time.time() - last_buy_ts) < entry_cooldown_sec:
+                should_buy = False
+                buy_reasons.append("post_entry_cooldown_block")
+
             # 진입봉 저점 이탈 손절
             if stop_by_entry_candle and coin_balance > 0 and last_buy_stop_price is not None and current_price < last_buy_stop_price:
                 should_sell = True
@@ -843,12 +894,13 @@ def run():
                 buy_reasons.append(f"max_position_block({max_position_krw:.0f})")
 
             logging.info(
-                "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
+                "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f spread=%.1fbps price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
                 risk_mode,
                 risk_score,
                 risk_source,
                 int(mtf_trend_ok),
                 -1.0 if rr_value is None else rr_value,
+                spread_bps,
                 current_price,
                 coin_value_krw,
                 krw_balance,
@@ -866,6 +918,52 @@ def run():
                 metrics["rsi"],
                 news_state.negative_score,
             )
+
+            # 분할 익절(1R,2R 등)
+            partial_tp_executed = False
+            if coin_balance > 0 and avg_buy_price > 0 and last_buy_stop_price is not None and last_buy_stop_price < avg_buy_price:
+                risk_unit = avg_buy_price - last_buy_stop_price
+                r_now = (current_price - avg_buy_price) / max(risk_unit, 1e-9)
+                for lvl, ratio in zip(partial_tp_levels, partial_tp_ratios):
+                    key = f"{lvl:.4f}"
+                    if key in partial_tp_done:
+                        continue
+                    if r_now >= lvl and ratio > 0:
+                        tp_coin = coin_balance * min(max(ratio, 0.0), 1.0)
+                        tp_value = tp_coin * current_price
+                        if tp_value >= min_sell_krw:
+                            logging.warning("PARTIAL TP | R=%.2f level=%.2f ratio=%.2f", r_now, lvl, ratio)
+                            append_trade_log(trade_log_path, {
+                                "ts": int(time.time()),
+                                "side": "sell_partial",
+                                "market": market,
+                                "price": current_price,
+                                "score": signal_score,
+                                "reasons": [f"partial_tp_{lvl:.2f}R"],
+                                "dry_run": dry_run,
+                            })
+                            if dry_run:
+                                last_action_ts = now_ts
+                                last_signal_hash = make_signal_hash("sell_partial", [f"partial_tp_{lvl:.2f}R"], int(signal_score), market)
+                            else:
+                                notify_event(alert_webhook_url, alert_events, "order_sent", f"sell_partial sent {market} ratio={ratio:.2f}")
+                                result = place_order_with_retry("sell_partial_market_order", upbit.sell_market_order, market, tp_coin)
+                                logging.warning("sell_partial result: %s", result)
+                            partial_tp_done.add(key)
+                            runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                            partial_tp_executed = True
+                        break
+
+            if partial_tp_executed:
+                runtime_state["last_action_ts"] = float(last_action_ts)
+                runtime_state["last_signal_hash"] = last_signal_hash
+                runtime_state["pending_order"] = pending_order
+                runtime_state["last_buy_stop_price"] = last_buy_stop_price
+                runtime_state["last_buy_ts"] = float(last_buy_ts)
+                runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+                save_runtime_state(runtime_state_path, runtime_state)
+                time.sleep(check_seconds)
+                continue
 
             if should_sell:
                 sell_amount_coin = coin_balance * active_sell_ratio
@@ -940,6 +1038,8 @@ def run():
                         logging.warning("DRY_RUN buy | market=%s krw=%.0f", market, buy_krw)
                         last_action_ts = now_ts
                         last_signal_hash = signal_hash
+                        last_buy_ts = now_ts
+                        partial_tp_done = set()
                         runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         if stop_by_entry_candle:
                             last_buy_stop_price = last_low
@@ -958,6 +1058,8 @@ def run():
                         if filled:
                             last_action_ts = now_ts
                             last_signal_hash = signal_hash
+                            last_buy_ts = now_ts
+                            partial_tp_done = set()
                             runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                             notify_event(alert_webhook_url, alert_events, "filled", f"buy filled {market} price={current_price:.0f}")
                             if stop_by_entry_candle:
@@ -995,6 +1097,8 @@ def run():
             runtime_state["last_signal_hash"] = last_signal_hash
             runtime_state["pending_order"] = pending_order
             runtime_state["last_buy_stop_price"] = last_buy_stop_price
+            runtime_state["last_buy_ts"] = float(last_buy_ts)
+            runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
             save_runtime_state(runtime_state_path, runtime_state)
 
             time.sleep(check_seconds)
