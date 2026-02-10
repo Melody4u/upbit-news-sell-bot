@@ -34,6 +34,13 @@ copy .env.example .env
 python bot.py
 ```
 
+## 3-1) 대시보드 실행 (로컬 웹)
+
+```bash
+python dashboard.py
+# 브라우저에서 http://127.0.0.1:8787 접속
+```
+
 ## 4) 핵심 기능
 
 - MA20/MA200 기반 추세 + 스퀴즈/브레이크아웃 판단
