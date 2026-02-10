@@ -1,11 +1,11 @@
 # Upbit News Sell Bot (Starter)
 
-?낅퉬??蹂댁쑀 ?ъ??섏쓣 ??곸쑝濡?
-- ?좊챸 ?몃젅?대뜑?ㅼ씠 ?먯＜ ?곕뒗 怨꾩뿴??李⑦듃 洹쒖튃(異붿꽭/?뚰뙆/蹂?숈꽦/怨쇱뿴)
-- Brave ?댁뒪 ?낆옱 ?먯닔
-瑜?寃고빀??留ㅼ닔/留ㅻ룄 ?좏샇瑜??대뒗 **?ㅽ???肄붾뱶**?낅땲??
+업비트 보유 포지션을 대상으로,
+- 차트 기반 다중 시그널(추세/브레이크아웃/변동성)
+- Brave 뉴스 리스크 필터
+를 결합해 매수/매도 판단을 보조하는 자동매매 봇입니다.
 
-## 1) ?ㅼ튂
+## 1) 설치
 
 ```bash
 cd upbit-news-sell-bot
@@ -16,53 +16,37 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-## 2) ?ㅼ젙(.env)
+## 2) 환경변수(.env)
 
-?꾩닔:
+필수:
 - `UPBIT_ACCESS_KEY`
 - `UPBIT_SECRET_KEY`
 - `BRAVE_API_KEY`
 
-?덉쟾 湲곕낯媛?
-- `DRY_RUN=true` (?ㅼ＜臾????섍컧)
-- `SELL_RATIO=0.25` (?좏샇 ??蹂댁쑀 肄붿씤??25%留?留ㅻ룄)
-- `BUY_RATIO=0.25` (?좏샇 ??蹂댁쑀 KRW??25%留?留ㅼ닔)
+권장 기본값:
+- `DRY_RUN=true` (실주문 없이 테스트)
+- `SELL_RATIO=0.25`
+- `BUY_RATIO=0.25`
 
-## 3) ?ㅽ뻾
+## 3) 실행
 
 ```bash
 python bot.py
 ```
 
-## 4) ?숈옉 媛쒖슂
+## 4) 핵심 기능
 
-- `CHECK_SECONDS`留덈떎 ?꾩옱 ?ъ???媛寃??뺤씤
-- `NEWS_INTERVAL_SECONDS`留덈떎 Brave 寃?됱쑝濡??댁뒪 ?먯닔 媛깆떊
-- 李⑦듃 ?좏샇 ?먯닔???먯닔???붿쭊):
-  - 20/200 ?대룞?됯퇏 湲곕컲 諛⑺뼢 ?뺤씤(200?????꾨옒)
-  - 20/200 媛꾧꺽 異뺤냼(?ㅽ댁쫰) + ?섎갑 ?댄깉 媛먯?
-  - ?〓낫??援먯감 鍮덈쾲) ?꾪꽣濡?怨쇱엵 ?좏샇 ?꾪솕
-  - EMA 異붿꽭 ?쏀솕(?곕뱶?щ줈??+ ADX ?꾪꽣)
-  - Donchian ?섎떒 ?댄깉
-  - ATR ?몃젅?쇰쭅 ?ㅽ깙 ?댄깉
-  - RSI 怨쇱뿴 ??爰얠엫 + 嫄곕옒???ㅽ뙆?댄겕
-  - ?됯퇏?④? 湲곗? ?먯젅
-- ?댁뒪 ?낆옱 ?먯닔媛 ?꾧퀎移??댁긽?대㈃ 留ㅻ룄 ?먯닔??媛以? 留ㅼ닔 ?먯닔??媛먯궛
-- `SIGNAL_SCORE_THRESHOLD` ?댁긽?대㈃ 留ㅻ룄 ?좏샇
-- `BUY_SCORE_THRESHOLD` ?댁긽?대㈃ 留ㅼ닔 ?좏샇
-- `ENTRY_MODE=confirm_breakout`???뚮뒗 吏곸쟾 怨좎젏 紐명넻 ?뚰뙆(?λ? ?묐큺) + 諛뺤뒪 ?곷떒 ?뚰뙆 ?뺤씤 ??留ㅼ닔
-- 諛뺤뒪 ?곷떒 由ы뀒?ㅽ듃 吏吏 ?뺤씤 ??異붽?吏꾩엯(`ENABLE_RETEST_ADDON`, `ADDON_RATIO`)
-- 吏꾩엯遊?????댄깉 ?먯젅(`STOP_BY_ENTRY_CANDLE`) + MA22 ?댄깉 泥?궛(`TAKE_PROFIT_BY_MA22`)
-- ?몃젅?대뱶/?먯젅 濡쒓렇? 媛쒖꽑 ?쇰뱶諛깆쓣 `TRADE_LOG_PATH`??JSONL濡?湲곕줉
-- 由ъ뒪???곹븳: 怨좎젏 ?鍮??먯떎瑜?`MAX_DRAWDOWN_PCT` ?꾨떖 ?먮뒗 ?곌컙 ?먯젅 ?잛닔 `MAX_YEARLY_STOP_COUNT` ?꾨떖 ???먮룞 以묒?
-- 由ы룷???ㅽ겕由쏀듃: `python report.py daily|weekly|monthly` (?쒕떇 ?쒖븞 ?ы븿)
-- Risk mode auto-switch (aggressive / neutral / conservative)
-  - Source priority: `MARKET_RISK_PATH` JSON (`{"risk_score": 0~100}`) -> fallback to internal news score
-  - Aggressive (<=30): lower thresholds, higher buy ratio
-  - Conservative (>=61): stricter buy threshold, lower buy ratio, higher sell ratio
+- MA20/MA200 기반 추세 + 스퀴즈/브레이크아웃 판단
+- EMA/ADX, Donchian, ATR, RSI, 거래량 보조 시그널
+- 뉴스 리스크 반영(네거티브 뉴스 점수)
+- 손절/청산 규칙, 리트레이스 추가진입, 리스크 중단(DD/연간 손절 횟수)
+- 거래 저널(JSONL) + `report.py`로 일/주/월 리포트 생성
+- Risk mode 자동 전환(aggressive/neutral/conservative)
+  - `MARKET_RISK_PATH`의 `risk_score(0~100)` 우선
+  - 없으면 내부 뉴스 점수 기반 fallback
 
-## 5) 二쇱쓽
+## 5) 주의
 
-- ??肄붾뱶???ъ옄 議곗뼵???꾨땲??**?먮룞???덉떆**?낅땲??
-- ?ㅺ굅????諛섎뱶???뚯븸/?뚯뒪?몃줈 寃利앺븯?몄슂.
-- ?ㅻ뒗 `.env`濡쒕쭔 愿由ы븯怨??덈? 源껎뿀釉뚯뿉 ?щ━吏 留덉꽭??
+- 본 코드는 투자 조언이 아닙니다.
+- 반드시 소액/테스트로 먼저 검증하세요.
+- API 키는 `.env`로만 관리하고 커밋하지 마세요.

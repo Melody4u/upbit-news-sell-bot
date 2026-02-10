@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 
 NEGATIVE_KEYWORDS = [
-    "hack", "?댄궧", "?쒖옱", "湲덉?", "?먯뇙", "?뚯넚", "?뚯궛", "?좎쓽醫낅ぉ", "?곸옣?먯?", "?낆옱", "洹쒖젣", "investigation"
+    "hack", "해킹", "제재", "금지", "소송", "파산", "상장폐지", "투자주의", "규제", "investigation"
 ]
 
 
@@ -150,7 +150,7 @@ def get_account_state(upbit, market: str):
 
     current_price = pyupbit.get_current_price(market)
     if current_price is None:
-        raise RuntimeError("?꾩옱媛 議고쉶 ?ㅽ뙣")
+        raise RuntimeError("현재가 조회 실패")
 
     return coin_balance, avg_buy_price, float(current_price)
 
@@ -495,7 +495,7 @@ def run():
     }
 
     if not access or not secret:
-        raise RuntimeError("UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY瑜?.env???낅젰?섏꽭??")
+        raise RuntimeError("UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY를 .env에 입력하세요.")
 
     upbit = pyupbit.Upbit(access, secret)
     news_state = NewsState()
