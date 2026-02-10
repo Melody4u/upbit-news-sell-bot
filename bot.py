@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
@@ -266,6 +267,19 @@ def place_order_with_retry(action_name: str, fn, *args, retries: int = 3, delay_
     raise RuntimeError(f"{action_name} failed after retries: {last_err}")
 
 
+def make_signal_hash(side: str, reasons: List[str], score: int, market: str) -> str:
+    payload = f"{side}|{market}|{score}|{'|'.join(sorted(reasons))}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def verify_position_change(before_coin: float, before_krw: float, after_coin: float, after_krw: float, side: str) -> bool:
+    if side == "buy":
+        return (after_coin > before_coin) or (after_krw < before_krw)
+    if side == "sell":
+        return (after_coin < before_coin) or (after_krw > before_krw)
+    return False
+
+
 def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, float], mtf_trend_ok: bool = True) -> Tuple[int, List[str], Dict[str, float]]:
     close = df["close"]
     open_ = df["open"]
@@ -461,6 +475,8 @@ def run():
     buy_score_threshold = get_env_int("BUY_SCORE_THRESHOLD", 3)
 
     entry_mode = os.getenv("ENTRY_MODE", "confirm_breakout")
+    breakout_gate_mode = os.getenv("BREAKOUT_GATE_MODE", "and").lower()  # and|or
+    trade_cooldown_seconds = get_env_int("TRADE_COOLDOWN_SECONDS", 120)
     probe_entry_ratio = get_env_float("PROBE_ENTRY_RATIO", 0.15)
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
     mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute30")
@@ -525,6 +541,9 @@ def run():
     active_box_high = None
     addon_done = False
     runtime_state = load_runtime_state(runtime_state_path)
+    last_action_ts = 0.0
+    last_signal_hash = ""
+    pending_order = False
 
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
 
@@ -558,7 +577,8 @@ def run():
                 runtime_state["year"] = now_year
                 runtime_state["yearly_stop_count"] = 0
 
-            # ?먮낯怨≪꽑 怨좎젏/?쒕줈?곕떎??愿由?            runtime_state["equity_peak"] = max(float(runtime_state.get("equity_peak", 0.0)), equity)
+            # 자본곡선 고점/드로우다운 관리
+            runtime_state["equity_peak"] = max(float(runtime_state.get("equity_peak", 0.0)), equity)
             peak = max(float(runtime_state.get("equity_peak", 0.0)), 1.0)
             drawdown_pct = (peak - equity) / peak
 
@@ -662,11 +682,12 @@ def run():
             should_sell = signal_score >= active_signal_threshold and coin_balance > 0
             should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
 
-            # 吏꾩엯 ?뺤젙: 吏곸쟾 怨좎젏 紐명넻 ?뚰뙆 + ?〓낫 諛뺤뒪 ?뚰뙆 湲곗?
-            if entry_mode == "confirm_breakout" and not breakout_long:
-                should_buy = False
-            if entry_mode == "confirm_breakout" and not box_breakout_long:
-                should_buy = False
+            # 진입 확정: breakout 조건 결합 방식(and/or) 파라미터화
+            if entry_mode == "confirm_breakout":
+                gate_ok = (breakout_long and box_breakout_long) if breakout_gate_mode == "and" else (breakout_long or box_breakout_long)
+                if not gate_ok:
+                    should_buy = False
+                    buy_reasons.append(f"breakout_gate_block(mode={breakout_gate_mode})")
 
             # 손익비(R:R) 필터
             rr_value = None
@@ -684,6 +705,24 @@ def run():
             if stop_by_entry_candle and coin_balance > 0 and last_buy_stop_price is not None and current_price < last_buy_stop_price:
                 should_sell = True
                 signal_reasons.append(f"entry_candle_stop({last_buy_stop_price:.0f})")
+
+            # 멱등성/중복 주문 방지
+            now_ts = time.time()
+            in_cooldown = (now_ts - last_action_ts) < trade_cooldown_seconds
+            side_for_hash = "sell" if should_sell else ("buy" if should_buy else "none")
+            reasons_for_hash = signal_reasons if should_sell else buy_reasons
+            score_for_hash = signal_score if should_sell else buy_score
+            signal_hash = make_signal_hash(side_for_hash, reasons_for_hash, int(score_for_hash), market)
+
+            if pending_order:
+                should_sell = False
+                should_buy = False
+            elif in_cooldown:
+                should_sell = False
+                should_buy = False
+            elif side_for_hash != "none" and signal_hash == last_signal_hash:
+                should_sell = False
+                should_buy = False
 
             # MA22 ?섑뼢 ?댄깉 ?듭젅/泥?궛
             ma_exit_now = float(ma_exit.iloc[-1]) if pd.notna(ma_exit.iloc[-1]) else 0.0
@@ -745,9 +784,22 @@ def run():
                     logging.warning("SELL FEEDBACK | %s", feedback)
                     if dry_run:
                         logging.warning("DRY_RUN sell | market=%s amount=%.8f (~%.0fKRW)", market, sell_amount_coin, sell_value_krw)
+                        last_action_ts = now_ts
+                        last_signal_hash = signal_hash
                     else:
+                        pending_order = True
+                        before_coin, before_krw = coin_balance, krw_balance
                         result = place_order_with_retry("sell_market_order", upbit.sell_market_order, market, sell_amount_coin)
                         logging.warning("sell_market_order result: %s", result)
+                        time.sleep(1.0)
+                        after_coin, _, _ = get_account_state(upbit, market)
+                        after_krw = get_krw_balance(upbit)
+                        filled = verify_position_change(before_coin, before_krw, after_coin, after_krw, "sell")
+                        logging.warning("sell fill check | filled=%s before_coin=%.8f after_coin=%.8f", filled, before_coin, after_coin)
+                        if filled:
+                            last_action_ts = now_ts
+                            last_signal_hash = signal_hash
+                        pending_order = False
 
             elif should_buy:
                 base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else active_buy_ratio
@@ -767,13 +819,26 @@ def run():
                     })
                     if dry_run:
                         logging.warning("DRY_RUN buy | market=%s krw=%.0f", market, buy_krw)
+                        last_action_ts = now_ts
+                        last_signal_hash = signal_hash
                         if stop_by_entry_candle:
                             last_buy_stop_price = last_low
                     else:
+                        pending_order = True
+                        before_coin, before_krw = coin_balance, krw_balance
                         result = place_order_with_retry("buy_market_order", upbit.buy_market_order, market, buy_krw)
                         logging.warning("buy_market_order result: %s", result)
-                        if stop_by_entry_candle:
-                            last_buy_stop_price = last_low
+                        time.sleep(1.0)
+                        after_coin, _, _ = get_account_state(upbit, market)
+                        after_krw = get_krw_balance(upbit)
+                        filled = verify_position_change(before_coin, before_krw, after_coin, after_krw, "buy")
+                        logging.warning("buy fill check | filled=%s before_coin=%.8f after_coin=%.8f", filled, before_coin, after_coin)
+                        if filled:
+                            last_action_ts = now_ts
+                            last_signal_hash = signal_hash
+                            if stop_by_entry_candle:
+                                last_buy_stop_price = last_low
+                        pending_order = False
 
             # 諛뺤뒪 ?뚰뙆 ??由ы뀒?ㅽ듃(吏吏 ?뺤씤) 異붽?吏꾩엯
             if enable_retest_addon and coin_balance > 0 and active_box_high is not None and not addon_done:
@@ -801,6 +866,7 @@ def run():
             time.sleep(check_seconds)
 
         except Exception as e:
+            pending_order = False
             logging.exception("loop error: %s", e)
             time.sleep(max(5, check_seconds))
 
