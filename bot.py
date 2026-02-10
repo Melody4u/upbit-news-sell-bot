@@ -222,25 +222,30 @@ def apply_risk_mode(mode: str, base: Dict[str, float], cfg: Dict[str, float]) ->
 
 
 def load_runtime_state(path: str) -> Dict:
+    base = {
+        "equity_peak": 0.0,
+        "year": time.localtime().tm_year,
+        "yearly_stop_count": 0,
+        "halted": False,
+        "halt_reason": "",
+        "last_action_ts": 0.0,
+        "last_signal_hash": "",
+        "pending_order": None,
+        "last_buy_stop_price": None,
+        "day_key": time.strftime("%Y-%m-%d"),
+        "day_start_equity": 0.0,
+        "trades_today": 0,
+    }
     if not os.path.exists(path):
-        return {
-            "equity_peak": 0.0,
-            "year": time.localtime().tm_year,
-            "yearly_stop_count": 0,
-            "halted": False,
-            "halt_reason": "",
-        }
+        return base
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            base.update(loaded)
+        return base
     except Exception:
-        return {
-            "equity_peak": 0.0,
-            "year": time.localtime().tm_year,
-            "yearly_stop_count": 0,
-            "halted": False,
-            "halt_reason": "",
-        }
+        return base
 
 
 def save_runtime_state(path: str, state: Dict) -> None:
@@ -278,6 +283,27 @@ def verify_position_change(before_coin: float, before_krw: float, after_coin: fl
     if side == "sell":
         return (after_coin < before_coin) or (after_krw > before_krw)
     return False
+
+
+def notify_event(webhook_url: str, enabled_events: set, event_name: str, message: str) -> None:
+    if not webhook_url or event_name not in enabled_events:
+        return
+    try:
+        requests.post(webhook_url, json={"event": event_name, "text": message}, timeout=5)
+    except Exception as e:
+        logging.warning("notify failed(%s): %s", event_name, e)
+
+
+def get_order_state(upbit, uuid: str):
+    try:
+        o = upbit.get_order(uuid)
+        if isinstance(o, dict):
+            return o.get("state", "unknown"), o
+        if isinstance(o, list) and o:
+            return o[0].get("state", "unknown"), o[0]
+        return "unknown", o
+    except Exception as e:
+        return "error", {"error": str(e)}
 
 
 def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, float], mtf_trend_ok: bool = True) -> Tuple[int, List[str], Dict[str, float]]:
@@ -497,6 +523,12 @@ def run():
     market_risk_path = os.getenv("MARKET_RISK_PATH", "logs/market_risk.json")
     max_drawdown_pct = get_env_float("MAX_DRAWDOWN_PCT", 0.10)
     max_yearly_stop_count = get_env_int("MAX_YEARLY_STOP_COUNT", 3)
+    max_daily_loss_pct = get_env_float("MAX_DAILY_LOSS_PCT", 0.03)
+    max_trades_per_day = get_env_int("MAX_TRADES_PER_DAY", 20)
+    max_position_krw = get_env_float("MAX_POSITION_KRW", 0)
+    max_slippage_bps = get_env_float("MAX_SLIPPAGE_BPS", 30)
+    alert_webhook_url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+    alert_events = set(x.strip() for x in os.getenv("ALERT_EVENTS", "order_sent,filled,rejected,halted,resume").split(",") if x.strip())
 
     cfg = {
         "EMA_FAST": get_env_int("EMA_FAST", 20),
@@ -538,13 +570,19 @@ def run():
 
     upbit = pyupbit.Upbit(access, secret)
     news_state = NewsState()
-    last_buy_stop_price = None
     active_box_high = None
     addon_done = False
     runtime_state = load_runtime_state(runtime_state_path)
-    last_action_ts = 0.0
-    last_signal_hash = ""
-    pending_order = False
+    last_action_ts = float(runtime_state.get("last_action_ts", 0.0) or 0.0)
+    last_signal_hash = str(runtime_state.get("last_signal_hash", "") or "")
+    pending_order = runtime_state.get("pending_order")
+    last_buy_stop_price = runtime_state.get("last_buy_stop_price")
+    if last_buy_stop_price is not None:
+        try:
+            last_buy_stop_price = float(last_buy_stop_price)
+        except Exception:
+            last_buy_stop_price = None
+    prev_halted = bool(runtime_state.get("halted", False))
 
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
 
@@ -572,31 +610,62 @@ def run():
             coin_value_krw = coin_balance * current_price
             equity = krw_balance + coin_value_krw
 
-            # ?곕룄 諛붾뚮㈃ ?먯젅 移댁슫??由ъ뀑
+            # 연도/일자 상태 관리
             now_year = time.localtime().tm_year
+            day_key = time.strftime("%Y-%m-%d")
             if runtime_state.get("year") != now_year:
                 runtime_state["year"] = now_year
                 runtime_state["yearly_stop_count"] = 0
+            if runtime_state.get("day_key") != day_key:
+                runtime_state["day_key"] = day_key
+                runtime_state["day_start_equity"] = equity
+                runtime_state["trades_today"] = 0
 
-            # 자본곡선 고점/드로우다운 관리
+            # 재시작 내구성: 대기 주문 상태 조회
+            if pending_order and isinstance(pending_order, dict) and pending_order.get("uuid"):
+                st, order_obj = get_order_state(upbit, pending_order.get("uuid"))
+                if st in ("done", "cancel"):
+                    notify_event(alert_webhook_url, alert_events, "filled" if st == "done" else "rejected", f"pending_order_resolved side={pending_order.get('side')} state={st}")
+                    pending_order = None
+                elif st == "error":
+                    logging.warning("pending order check error: %s", order_obj)
+                else:
+                    logging.info("pending order wait | side=%s state=%s", pending_order.get("side"), st)
+
+            # 자본곡선/킬스위치 관리
             runtime_state["equity_peak"] = max(float(runtime_state.get("equity_peak", 0.0)), equity)
             peak = max(float(runtime_state.get("equity_peak", 0.0)), 1.0)
             drawdown_pct = (peak - equity) / peak
+            day_start_equity = float(runtime_state.get("day_start_equity", 0.0) or 0.0)
+            daily_loss_pct = ((day_start_equity - equity) / day_start_equity) if day_start_equity > 0 else 0.0
 
             if drawdown_pct >= max_drawdown_pct:
                 runtime_state["halted"] = True
                 runtime_state["halt_reason"] = f"max_drawdown_reached({drawdown_pct:.2%})"
-
+            if daily_loss_pct >= max_daily_loss_pct:
+                runtime_state["halted"] = True
+                runtime_state["halt_reason"] = f"max_daily_loss_reached({daily_loss_pct:.2%})"
             if int(runtime_state.get("yearly_stop_count", 0)) >= max_yearly_stop_count:
                 runtime_state["halted"] = True
                 runtime_state["halt_reason"] = f"yearly_stop_count_reached({runtime_state.get('yearly_stop_count', 0)})"
 
+            # 상태 저장(복구용 핵심 필드)
+            runtime_state["last_action_ts"] = float(last_action_ts)
+            runtime_state["last_signal_hash"] = last_signal_hash
+            runtime_state["pending_order"] = pending_order
+            runtime_state["last_buy_stop_price"] = last_buy_stop_price
             save_runtime_state(runtime_state_path, runtime_state)
 
             if runtime_state.get("halted", False):
+                if not prev_halted:
+                    notify_event(alert_webhook_url, alert_events, "halted", f"halted: {runtime_state.get('halt_reason', 'unknown')}")
+                prev_halted = True
                 logging.error("TRADING HALTED | reason=%s", runtime_state.get("halt_reason", "unknown"))
                 time.sleep(check_seconds)
                 continue
+            elif prev_halted:
+                notify_event(alert_webhook_url, alert_events, "resume", "trading resumed")
+                prev_halted = False
 
             if coin_balance <= 0:
                 last_buy_stop_price = None
@@ -746,6 +815,24 @@ def run():
                         should_buy = False
                 signal_hash = final_hash
 
+            # 슬리피지 가드 + 일일 트레이드 제한 + 포지션 한도
+            slippage_bps = (abs(current_price - last_close) / max(last_close, 1e-9)) * 10000
+            if (should_sell or should_buy) and slippage_bps > max_slippage_bps:
+                should_sell = False
+                should_buy = False
+                logging.warning("signal blocked by slippage | bps=%.1f > max=%.1f", slippage_bps, max_slippage_bps)
+
+            if int(runtime_state.get("trades_today", 0)) >= max_trades_per_day:
+                if should_buy or (should_sell and not emergency_sell):
+                    should_buy = False
+                    if not emergency_sell:
+                        should_sell = False
+                    logging.warning("signal blocked by max_trades_per_day=%s", max_trades_per_day)
+
+            if should_buy and max_position_krw > 0 and (coin_value_krw + (krw_balance * min(probe_entry_ratio if entry_mode == 'confirm_breakout' else active_buy_ratio, active_buy_ratio))) > max_position_krw:
+                should_buy = False
+                buy_reasons.append(f"max_position_block({max_position_krw:.0f})")
+
             logging.info(
                 "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
                 risk_mode,
@@ -802,11 +889,14 @@ def run():
                         logging.warning("DRY_RUN sell | market=%s amount=%.8f (~%.0fKRW)", market, sell_amount_coin, sell_value_krw)
                         last_action_ts = now_ts
                         last_signal_hash = signal_hash
+                        runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                     else:
-                        pending_order = True
                         before_coin, before_krw = coin_balance, krw_balance
+                        notify_event(alert_webhook_url, alert_events, "order_sent", f"sell sent {market} amount={sell_amount_coin:.8f}")
                         result = place_order_with_retry("sell_market_order", upbit.sell_market_order, market, sell_amount_coin)
                         logging.warning("sell_market_order result: %s", result)
+                        order_uuid = result.get("uuid") if isinstance(result, dict) else None
+                        pending_order = {"uuid": order_uuid, "side": "sell", "created_ts": now_ts} if order_uuid else None
                         time.sleep(1.0)
                         after_coin, _, _ = get_account_state(upbit, market)
                         after_krw = get_krw_balance(upbit)
@@ -815,7 +905,11 @@ def run():
                         if filled:
                             last_action_ts = now_ts
                             last_signal_hash = signal_hash
-                        pending_order = False
+                            runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                            notify_event(alert_webhook_url, alert_events, "filled", f"sell filled {market} price={current_price:.0f}")
+                            pending_order = None
+                        elif order_uuid is None:
+                            notify_event(alert_webhook_url, alert_events, "rejected", f"sell rejected {market}")
 
             elif should_buy:
                 base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else active_buy_ratio
@@ -837,13 +931,16 @@ def run():
                         logging.warning("DRY_RUN buy | market=%s krw=%.0f", market, buy_krw)
                         last_action_ts = now_ts
                         last_signal_hash = signal_hash
+                        runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         if stop_by_entry_candle:
                             last_buy_stop_price = last_low
                     else:
-                        pending_order = True
                         before_coin, before_krw = coin_balance, krw_balance
+                        notify_event(alert_webhook_url, alert_events, "order_sent", f"buy sent {market} krw={buy_krw:.0f}")
                         result = place_order_with_retry("buy_market_order", upbit.buy_market_order, market, buy_krw)
                         logging.warning("buy_market_order result: %s", result)
+                        order_uuid = result.get("uuid") if isinstance(result, dict) else None
+                        pending_order = {"uuid": order_uuid, "side": "buy", "created_ts": now_ts} if order_uuid else None
                         time.sleep(1.0)
                         after_coin, _, _ = get_account_state(upbit, market)
                         after_krw = get_krw_balance(upbit)
@@ -852,11 +949,15 @@ def run():
                         if filled:
                             last_action_ts = now_ts
                             last_signal_hash = signal_hash
+                            runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                            notify_event(alert_webhook_url, alert_events, "filled", f"buy filled {market} price={current_price:.0f}")
                             if stop_by_entry_candle:
                                 last_buy_stop_price = last_low
-                        pending_order = False
+                            pending_order = None
+                        elif order_uuid is None:
+                            notify_event(alert_webhook_url, alert_events, "rejected", f"buy rejected {market}")
 
-            # 諛뺤뒪 ?뚰뙆 ??由ы뀒?ㅽ듃(吏吏 ?뺤씤) 異붽?吏꾩엯
+            # 박스 돌파 후 리테스트(지지 확인) 추가진입
             if enable_retest_addon and coin_balance > 0 and active_box_high is not None and not addon_done:
                 retest_band = active_box_high * box_buffer_pct
                 retest_hit = abs(current_price - active_box_high) <= retest_band
@@ -875,14 +976,24 @@ def run():
                             "dry_run": dry_run,
                         })
                         if not dry_run:
+                            notify_event(alert_webhook_url, alert_events, "order_sent", f"buy_addon sent {market} krw={addon_krw:.0f}")
                             result = place_order_with_retry("buy_addon_market_order", upbit.buy_market_order, market, addon_krw)
                             logging.warning("buy_addon result: %s", result)
+                        runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         addon_done = True
+
+            runtime_state["last_action_ts"] = float(last_action_ts)
+            runtime_state["last_signal_hash"] = last_signal_hash
+            runtime_state["pending_order"] = pending_order
+            runtime_state["last_buy_stop_price"] = last_buy_stop_price
+            save_runtime_state(runtime_state_path, runtime_state)
 
             time.sleep(check_seconds)
 
         except Exception as e:
-            pending_order = False
+            pending_order = None
+            runtime_state["pending_order"] = None
+            save_runtime_state(runtime_state_path, runtime_state)
             logging.exception("loop error: %s", e)
             time.sleep(max(5, check_seconds))
 

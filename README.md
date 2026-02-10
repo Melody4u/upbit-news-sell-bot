@@ -49,7 +49,11 @@ python dashboard.py
 - 멀티 타임프레임 추세 확인(기본: 4시간봉 MA50>MA200)
 - 손익비(R:R) 필터(`MIN_RR`) 미충족 시 매수 차단
 - 중복 주문 방지: 쿨다운(`TRADE_COOLDOWN_SECONDS`) + 신호 해시 기반 멱등성
+- 재시작 내구성: 핵심 상태(last_action/signal/pending_order/stop_price)를 runtime_state에 저장/복구
+- 주문 추적: UUID 기반 pending 상태 확인 후 다음 주문 허용
 - 긴급 청산(MA 이탈) 시 멱등성 우회 여부 옵션(`EMERGENCY_SELL_BYPASS_IDEMPOTENCY`)
+- 슬리피지 가드(`MAX_SLIPPAGE_BPS`) 및 추가 Kill-switch(`MAX_DAILY_LOSS_PCT`, `MAX_TRADES_PER_DAY`, `MAX_POSITION_KRW`)
+- 운영 알림 웹훅(`ALERT_WEBHOOK_URL`, `ALERT_EVENTS`)
 - 브레이크아웃 게이트 결합 방식 파라미터화(`BREAKOUT_GATE_MODE=and|or`)
 - EMA/ADX, Donchian, ATR, RSI, 거래량 보조 시그널
 - 뉴스 리스크 반영(네거티브 뉴스 점수)
