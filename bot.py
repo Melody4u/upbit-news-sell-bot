@@ -463,7 +463,8 @@ def run():
     entry_mode = os.getenv("ENTRY_MODE", "confirm_breakout")
     probe_entry_ratio = get_env_float("PROBE_ENTRY_RATIO", 0.15)
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
-    mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute240")
+    mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute30")
+    mtf_interval_2 = os.getenv("MTF_TREND_INTERVAL_2", "minute240")
     mtf_lookback = get_env_int("MTF_TREND_LOOKBACK", 120)
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
@@ -588,17 +589,23 @@ def run():
                 continue
 
             df_mtf = pyupbit.get_ohlcv(market, interval=mtf_interval, count=max(mtf_lookback, 220))
+            df_mtf_2 = pyupbit.get_ohlcv(market, interval=mtf_interval_2, count=max(mtf_lookback, 220))
             mtf_trend_ok = True
-            if df_mtf is not None and len(df_mtf) >= 80:
-                mtf_close = df_mtf["close"]
-                mtf_ma50 = mtf_close.rolling(50).mean()
-                mtf_ma200 = mtf_close.rolling(200).mean()
-                mtf_trend_ok = bool(
-                    pd.notna(mtf_ma50.iloc[-1])
-                    and pd.notna(mtf_ma200.iloc[-1])
-                    and float(mtf_ma50.iloc[-1]) > float(mtf_ma200.iloc[-1])
-                    and float(mtf_close.iloc[-1]) > float(mtf_ma50.iloc[-1])
+
+            def _mtf_ok(_df):
+                if _df is None or len(_df) < 80:
+                    return False
+                _close = _df["close"]
+                _ma50 = _close.rolling(50).mean()
+                _ma200 = _close.rolling(200).mean()
+                return bool(
+                    pd.notna(_ma50.iloc[-1])
+                    and pd.notna(_ma200.iloc[-1])
+                    and float(_ma50.iloc[-1]) > float(_ma200.iloc[-1])
+                    and float(_close.iloc[-1]) > float(_ma50.iloc[-1])
                 )
+
+            mtf_trend_ok = _mtf_ok(df_mtf) and _mtf_ok(df_mtf_2)
 
             signal_score, signal_reasons, metrics = evaluate_signals(df, avg_buy_price, cfg, mtf_trend_ok=mtf_trend_ok)
             buy_score = int(metrics.get("buy_score", 0))
