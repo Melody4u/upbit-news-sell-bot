@@ -182,6 +182,44 @@ def append_trade_log(path: str, payload: Dict) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def load_market_risk(path: str) -> Dict:
+    if not path or not os.path.exists(path):
+        return {"risk_score": None, "source": "none"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        score = data.get("risk_score")
+        if score is None:
+            return {"risk_score": None, "source": "file_missing_score"}
+        score = max(0.0, min(100.0, float(score)))
+        return {"risk_score": score, "source": data.get("source", "file")}
+    except Exception:
+        return {"risk_score": None, "source": "file_error"}
+
+
+def resolve_risk_mode(risk_score: float, cfg: Dict[str, float]) -> str:
+    if risk_score >= cfg["RISK_CONSERVATIVE_MIN"]:
+        return "conservative"
+    if risk_score <= cfg["RISK_AGGRESSIVE_MAX"]:
+        return "aggressive"
+    return "neutral"
+
+
+def apply_risk_mode(mode: str, base: Dict[str, float], cfg: Dict[str, float]) -> Dict[str, float]:
+    tuned = dict(base)
+    if mode == "aggressive":
+        tuned["signal_score_threshold"] = cfg["AGG_SIGNAL_SCORE_THRESHOLD"]
+        tuned["buy_score_threshold"] = cfg["AGG_BUY_SCORE_THRESHOLD"]
+        tuned["sell_ratio"] = cfg["AGG_SELL_RATIO"]
+        tuned["buy_ratio"] = cfg["AGG_BUY_RATIO"]
+    elif mode == "conservative":
+        tuned["signal_score_threshold"] = cfg["CONS_SIGNAL_SCORE_THRESHOLD"]
+        tuned["buy_score_threshold"] = cfg["CONS_BUY_SCORE_THRESHOLD"]
+        tuned["sell_ratio"] = cfg["CONS_SELL_RATIO"]
+        tuned["buy_ratio"] = cfg["CONS_BUY_RATIO"]
+    return tuned
+
+
 def load_runtime_state(path: str) -> Dict:
     if not os.path.exists(path):
         return {
@@ -418,6 +456,7 @@ def run():
     addon_ratio = get_env_float("ADDON_RATIO", 0.1)
     trade_log_path = os.getenv("TRADE_LOG_PATH", "logs/trade_journal.jsonl")
     runtime_state_path = os.getenv("RUNTIME_STATE_PATH", "logs/runtime_state.json")
+    market_risk_path = os.getenv("MARKET_RISK_PATH", "logs/market_risk.json")
     max_drawdown_pct = get_env_float("MAX_DRAWDOWN_PCT", 0.10)
     max_yearly_stop_count = get_env_int("MAX_YEARLY_STOP_COUNT", 3)
 
@@ -443,6 +482,16 @@ def run():
         "BREAKOUT_BODY_ATR_MULT": get_env_float("BREAKOUT_BODY_ATR_MULT", 1.2),
         "SIDEWAYS_LOOKBACK": get_env_int("SIDEWAYS_LOOKBACK", 30),
         "SIDEWAYS_CROSS_THRESHOLD": get_env_int("SIDEWAYS_CROSS_THRESHOLD", 3),
+        "RISK_AGGRESSIVE_MAX": get_env_float("RISK_AGGRESSIVE_MAX", 30),
+        "RISK_CONSERVATIVE_MIN": get_env_float("RISK_CONSERVATIVE_MIN", 61),
+        "AGG_SIGNAL_SCORE_THRESHOLD": get_env_int("AGG_SIGNAL_SCORE_THRESHOLD", 2),
+        "AGG_BUY_SCORE_THRESHOLD": get_env_int("AGG_BUY_SCORE_THRESHOLD", 2),
+        "AGG_SELL_RATIO": get_env_float("AGG_SELL_RATIO", 0.20),
+        "AGG_BUY_RATIO": get_env_float("AGG_BUY_RATIO", 0.30),
+        "CONS_SIGNAL_SCORE_THRESHOLD": get_env_int("CONS_SIGNAL_SCORE_THRESHOLD", 2),
+        "CONS_BUY_SCORE_THRESHOLD": get_env_int("CONS_BUY_SCORE_THRESHOLD", 4),
+        "CONS_SELL_RATIO": get_env_float("CONS_SELL_RATIO", 0.35),
+        "CONS_BUY_RATIO": get_env_float("CONS_BUY_RATIO", 0.10),
     }
 
     if not access or not secret:
@@ -548,8 +597,29 @@ def run():
                 signal_reasons.append(f"negative_news(score={news_state.negative_score})")
                 buy_reasons.append(f"negative_news(score={news_state.negative_score})")
 
-            should_sell = signal_score >= signal_score_threshold and coin_balance > 0
-            should_buy = buy_score >= buy_score_threshold and krw_balance >= min_buy_krw
+            # risk mode: external file(logs/market_risk.json) -> fallback to news-derived score
+            external_risk = load_market_risk(market_risk_path)
+            if external_risk["risk_score"] is None:
+                risk_score = min(100.0, float(news_state.negative_score) * 25.0)
+                risk_source = "news_fallback"
+            else:
+                risk_score = float(external_risk["risk_score"])
+                risk_source = str(external_risk["source"])
+
+            risk_mode = resolve_risk_mode(risk_score, cfg)
+            tuned = apply_risk_mode(risk_mode, {
+                "signal_score_threshold": float(signal_score_threshold),
+                "buy_score_threshold": float(buy_score_threshold),
+                "sell_ratio": float(sell_ratio),
+                "buy_ratio": float(buy_ratio),
+            }, cfg)
+            active_signal_threshold = int(tuned["signal_score_threshold"])
+            active_buy_threshold = int(tuned["buy_score_threshold"])
+            active_sell_ratio = float(tuned["sell_ratio"])
+            active_buy_ratio = float(tuned["buy_ratio"])
+
+            should_sell = signal_score >= active_signal_threshold and coin_balance > 0
+            should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
 
             # 吏꾩엯 ?뺤젙: 吏곸쟾 怨좎젏 紐명넻 ?뚰뙆 + ?〓낫 諛뺤뒪 ?뚰뙆 湲곗?
             if entry_mode == "confirm_breakout" and not breakout_long:
@@ -569,14 +639,17 @@ def run():
                 signal_reasons.append(f"ma{ma_exit_period}_exit")
 
             logging.info(
-                "tick | price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
+                "tick | mode=%s risk=%.1f(%s) price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
+                risk_mode,
+                risk_score,
+                risk_source,
                 current_price,
                 coin_value_krw,
                 krw_balance,
                 signal_score,
-                signal_score_threshold,
+                active_signal_threshold,
                 buy_score,
-                buy_score_threshold,
+                active_buy_threshold,
                 int(breakout_long),
                 int(box_breakout_long),
                 metrics["ma20"],
@@ -588,7 +661,7 @@ def run():
             )
 
             if should_sell:
-                sell_amount_coin = coin_balance * sell_ratio
+                sell_amount_coin = coin_balance * active_sell_ratio
                 sell_value_krw = sell_amount_coin * current_price
 
                 if sell_value_krw < min_sell_krw:
@@ -621,8 +694,8 @@ def run():
                         logging.warning("sell_market_order result: %s", result)
 
             elif should_buy:
-                base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else buy_ratio
-                buy_krw = krw_balance * min(base_ratio, buy_ratio)
+                base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else active_buy_ratio
+                buy_krw = krw_balance * min(base_ratio, active_buy_ratio)
                 if buy_krw < min_buy_krw:
                     logging.warning("buy skipped | below min_buy_krw: %.0f < %.0f", buy_krw, min_buy_krw)
                 else:

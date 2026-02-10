@@ -56,6 +56,10 @@ python bot.py
 - ?몃젅?대뱶/?먯젅 濡쒓렇? 媛쒖꽑 ?쇰뱶諛깆쓣 `TRADE_LOG_PATH`??JSONL濡?湲곕줉
 - 由ъ뒪???곹븳: 怨좎젏 ?鍮??먯떎瑜?`MAX_DRAWDOWN_PCT` ?꾨떖 ?먮뒗 ?곌컙 ?먯젅 ?잛닔 `MAX_YEARLY_STOP_COUNT` ?꾨떖 ???먮룞 以묒?
 - 由ы룷???ㅽ겕由쏀듃: `python report.py daily|weekly|monthly` (?쒕떇 ?쒖븞 ?ы븿)
+- Risk mode auto-switch (aggressive / neutral / conservative)
+  - Source priority: `MARKET_RISK_PATH` JSON (`{"risk_score": 0~100}`) -> fallback to internal news score
+  - Aggressive (<=30): lower thresholds, higher buy ratio
+  - Conservative (>=61): stricter buy threshold, lower buy ratio, higher sell ratio
 
 ## 5) 二쇱쓽
 
