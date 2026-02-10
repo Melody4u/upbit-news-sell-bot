@@ -477,6 +477,7 @@ def run():
     entry_mode = os.getenv("ENTRY_MODE", "confirm_breakout")
     breakout_gate_mode = os.getenv("BREAKOUT_GATE_MODE", "and").lower()  # and|or
     trade_cooldown_seconds = get_env_int("TRADE_COOLDOWN_SECONDS", 120)
+    emergency_sell_bypass_idempotency = env_bool("EMERGENCY_SELL_BYPASS_IDEMPOTENCY", True)
     probe_entry_ratio = get_env_float("PROBE_ENTRY_RATIO", 0.15)
     breakout_lookback = get_env_int("BREAKOUT_LOOKBACK", 20)
     mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute30")
@@ -724,11 +725,26 @@ def run():
                 should_sell = False
                 should_buy = False
 
-            # MA22 ?섑뼢 ?댄깉 ?듭젅/泥?궛
+            # MA22 하향 이탈 익절/청산
             ma_exit_now = float(ma_exit.iloc[-1]) if pd.notna(ma_exit.iloc[-1]) else 0.0
+            emergency_sell = False
             if take_profit_by_ma22 and coin_balance > 0 and ma_exit_now > 0 and last_close < ma_exit_now:
                 should_sell = True
+                emergency_sell = True
                 signal_reasons.append(f"ma{ma_exit_period}_exit")
+
+            # 최종 멱등성 게이트 재적용 (긴급 청산 bypass 옵션)
+            if should_sell or should_buy:
+                final_side = "sell" if should_sell else "buy"
+                final_reasons = signal_reasons if should_sell else buy_reasons
+                final_score = signal_score if should_sell else buy_score
+                final_hash = make_signal_hash(final_side, final_reasons, int(final_score), market)
+                bypass = should_sell and emergency_sell and emergency_sell_bypass_idempotency
+                if not bypass:
+                    if pending_order or ((time.time() - last_action_ts) < trade_cooldown_seconds) or (final_hash == last_signal_hash):
+                        should_sell = False
+                        should_buy = False
+                signal_hash = final_hash
 
             logging.info(
                 "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
