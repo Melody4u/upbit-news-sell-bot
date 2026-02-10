@@ -1,4 +1,4 @@
-# Upbit News Sell Bot (Starter)
+# Upbit Auto Trading Bot (Starter)
 
 업비트 보유 포지션을 대상으로,
 - 차트 기반 다중 시그널(추세/브레이크아웃/변동성)
