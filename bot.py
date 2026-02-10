@@ -288,10 +288,15 @@ def verify_position_change(before_coin: float, before_krw: float, after_coin: fl
 def notify_event(webhook_url: str, enabled_events: set, event_name: str, message: str) -> None:
     if not webhook_url or event_name not in enabled_events:
         return
-    try:
-        requests.post(webhook_url, json={"event": event_name, "text": message}, timeout=5)
-    except Exception as e:
-        logging.warning("notify failed(%s): %s", event_name, e)
+    for attempt in range(2):
+        try:
+            requests.post(webhook_url, json={"event": event_name, "text": message}, timeout=5)
+            return
+        except Exception as e:
+            if attempt == 1:
+                logging.warning("notify failed(%s): %s", event_name, e)
+            else:
+                time.sleep(0.4)
 
 
 def get_order_state(upbit, uuid: str):
@@ -529,6 +534,7 @@ def run():
     max_slippage_bps = get_env_float("MAX_SLIPPAGE_BPS", 30)
     alert_webhook_url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
     alert_events = set(x.strip() for x in os.getenv("ALERT_EVENTS", "order_sent,filled,rejected,halted,resume").split(",") if x.strip())
+    pending_order_timeout_sec = get_env_int("PENDING_ORDER_TIMEOUT_SEC", 180)
 
     cfg = {
         "EMA_FAST": get_env_int("EMA_FAST", 20),
@@ -624,13 +630,16 @@ def run():
             # 재시작 내구성: 대기 주문 상태 조회
             if pending_order and isinstance(pending_order, dict) and pending_order.get("uuid"):
                 st, order_obj = get_order_state(upbit, pending_order.get("uuid"))
+                age_sec = max(0, int(time.time() - float(pending_order.get("created_ts", time.time()))))
                 if st in ("done", "cancel"):
                     notify_event(alert_webhook_url, alert_events, "filled" if st == "done" else "rejected", f"pending_order_resolved side={pending_order.get('side')} state={st}")
                     pending_order = None
                 elif st == "error":
                     logging.warning("pending order check error: %s", order_obj)
                 else:
-                    logging.info("pending order wait | side=%s state=%s", pending_order.get("side"), st)
+                    logging.info("pending order wait | side=%s state=%s age=%ss", pending_order.get("side"), st, age_sec)
+                    if age_sec >= pending_order_timeout_sec:
+                        notify_event(alert_webhook_url, alert_events, "rejected", f"pending_order_timeout side={pending_order.get('side')} age={age_sec}s state={st}")
 
             # 자본곡선/킬스위치 관리
             runtime_state["equity_peak"] = max(float(runtime_state.get("equity_peak", 0.0)), equity)

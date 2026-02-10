@@ -8,7 +8,7 @@
 ## 1) 설치
 
 ```bash
-cd upbit-news-sell-bot
+cd upbit-auto-trading-bot
 python -m venv .venv
 # Windows PowerShell
 .\.venv\Scripts\Activate.ps1
