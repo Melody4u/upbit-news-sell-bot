@@ -8,34 +8,77 @@
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <div class="wrap">
-      <header class="topbar">
-        <div>
-          <h1>키위 트레이딩 대시보드</h1>
-          <p class="sub">{{ market }} · Toss/TradingView 스타일 모니터</p>
-        </div>
-        <div class="controls">
-          <select id="interval">
-            <option value="minute15">15m</option>
-            <option value="minute60" selected>1h</option>
-            <option value="minute240">4h</option>
-            <option value="day">1D</option>
-          </select>
-          <button id="refreshBtn">새로고침</button>
-        </div>
-      </header>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">🥝 Kiwi Desk</div>
+        <button class="tab-btn active" data-tab="tab-overview">대시보드</button>
+        <button class="tab-btn" data-tab="tab-report">리포트</button>
+        <button class="tab-btn" data-tab="tab-news">뉴스</button>
+        <button class="tab-btn" data-tab="tab-account">계좌 현황</button>
+        <button class="tab-btn" data-tab="tab-logs">매수/매도 로그</button>
+      </aside>
 
-      <section class="cards" id="overviewCards"></section>
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1>키위 트레이딩 대시보드</h1>
+            <p class="sub">{{ market }} · 심플 모니터링</p>
+          </div>
+          <div class="controls">
+            <select id="interval">
+              <option value="minute15">15m</option>
+              <option value="minute60" selected>1h</option>
+              <option value="minute240">4h</option>
+              <option value="day">1D</option>
+            </select>
+            <button id="refreshBtn">새로고침</button>
+          </div>
+        </header>
 
-      <section class="panel chart-panel">
-        <div class="panel-title">가격 차트</div>
-        <div id="chart"></div>
-      </section>
+        <section id="tab-overview" class="tab active">
+          <section class="cards" id="overviewCards"></section>
+          <section class="panel chart-panel">
+            <div class="panel-title">가격 차트</div>
+            <div id="chart"></div>
+          </section>
+        </section>
 
-      <section class="panel">
-        <div class="panel-title">최근 거래 로그</div>
-        <div id="tradeTable"></div>
-      </section>
+        <section id="tab-report" class="tab">
+          <section class="panel">
+            <div class="panel-title-row">
+              <div class="panel-title">리포트</div>
+              <select id="reportMode">
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+            <div id="reportBox"></div>
+          </section>
+        </section>
+
+        <section id="tab-news" class="tab">
+          <section class="panel">
+            <div class="panel-title">시장 뉴스 / 리스크</div>
+            <div id="newsMeta" class="muted"></div>
+            <div id="newsList"></div>
+          </section>
+        </section>
+
+        <section id="tab-account" class="tab">
+          <section class="panel">
+            <div class="panel-title">계좌 현황</div>
+            <div id="accountGrid" class="cards account-cards"></div>
+          </section>
+        </section>
+
+        <section id="tab-logs" class="tab">
+          <section class="panel">
+            <div class="panel-title">매수/매도 로그</div>
+            <div id="tradeTable"></div>
+          </section>
+        </section>
+      </main>
     </div>
 
     <script>
@@ -50,88 +93,113 @@
         height: 460,
       });
 
-      const candleSeries = chart.addCandlestickSeries({
-        upColor: "#22c55e",
-        downColor: "#ef4444",
-        borderVisible: false,
-        wickUpColor: "#22c55e",
-        wickDownColor: "#ef4444",
-      });
-
+      const candleSeries = chart.addCandlestickSeries({ upColor: "#22c55e", downColor: "#ef4444", borderVisible: false, wickUpColor: "#22c55e", wickDownColor: "#ef4444" });
       const ma20Series = chart.addLineSeries({ color: "#60a5fa", lineWidth: 2 });
       const ma200Series = chart.addLineSeries({ color: "#f59e0b", lineWidth: 3 });
       const vwmaSeries = chart.addLineSeries({ color: "#a78bfa", lineWidth: 2 });
 
+      function num(v) { return typeof v === "number" ? Math.round(v).toLocaleString() : "-"; }
+
       async function loadOverview() {
-        const res = await fetch(`/api/overview?market=${market}`);
-        const d = await res.json();
+        const d = await (await fetch(`/api/overview?market=${market}`)).json();
         const a = d.account || {};
         const cards = [
           ["리스크 모드", `${d.risk_mode} (${d.risk_score ?? "-"})`],
-          ["현재가", a.price ? `${Math.round(a.price).toLocaleString()} KRW` : "-"],
-          ["총자산", a.equity ? `${Math.round(a.equity).toLocaleString()} KRW` : "-"],
+          ["현재가", a.price ? `${num(a.price)} KRW` : "-"],
+          ["총자산", a.equity ? `${num(a.equity)} KRW` : "-"],
           ["평가수익률", typeof a.pnl_pct === "number" ? `${a.pnl_pct.toFixed(2)}%` : "-"],
           ["최근 신호", `${d.latest_trade.side || "-"} @ ${d.latest_trade.time || "-"}`],
           ["거래횟수", `${d.trade_count} (buy ${d.buy_count} / sell ${d.sell_count})`],
         ];
-        document.getElementById("overviewCards").innerHTML = cards
-          .map(
-            ([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`
-          )
-          .join("");
+        document.getElementById("overviewCards").innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
       }
 
       async function loadChart() {
         const interval = document.getElementById("interval").value;
-        const res = await fetch(`/api/ohlcv?market=${market}&interval=${interval}&count=280`);
-        const d = await res.json();
+        const d = await (await fetch(`/api/ohlcv?market=${market}&interval=${interval}&count=280`)).json();
         if (!d.ok) return;
-
-        candleSeries.setData(
-          d.candles.map((x) => ({ time: x.time, open: x.open, high: x.high, low: x.low, close: x.close }))
-        );
-        ma20Series.setData(
-          d.candles.filter((x) => x.ma20 !== null).map((x) => ({ time: x.time, value: x.ma20 }))
-        );
-        ma200Series.setData(
-          d.candles.filter((x) => x.ma200 !== null).map((x) => ({ time: x.time, value: x.ma200 }))
-        );
-        vwmaSeries.setData(
-          d.candles.filter((x) => x.vwma100 !== null).map((x) => ({ time: x.time, value: x.vwma100 }))
-        );
+        candleSeries.setData(d.candles.map((x) => ({ time: x.time, open: x.open, high: x.high, low: x.low, close: x.close })));
+        ma20Series.setData(d.candles.filter((x) => x.ma20 !== null).map((x) => ({ time: x.time, value: x.ma20 })));
+        ma200Series.setData(d.candles.filter((x) => x.ma200 !== null).map((x) => ({ time: x.time, value: x.ma200 })));
+        vwmaSeries.setData(d.candles.filter((x) => x.vwma100 !== null).map((x) => ({ time: x.time, value: x.vwma100 })));
       }
 
       async function loadTrades() {
-        const res = await fetch(`/api/trades`);
-        const d = await res.json();
-        const rows = (d.rows || []).slice(0, 20);
+        const d = await (await fetch(`/api/trades`)).json();
+        const rows = (d.rows || []).slice(0, 50);
         const html = [`<table><thead><tr><th>시간</th><th>구분</th><th>가격</th><th>점수</th><th>사유</th></tr></thead><tbody>`]
-          .concat(
-            rows.map(
-              (r) =>
-                `<tr><td>${r.time}</td><td>${r.side}</td><td>${Math.round(r.price || 0).toLocaleString()}</td><td>${r.score || 0}</td><td>${(r.reasons || []).join(", ")}</td></tr>`
-            )
-          )
+          .concat(rows.map((r) => `<tr><td>${r.time}</td><td>${r.side}</td><td>${num(r.price)}</td><td>${r.score || 0}</td><td>${(r.reasons || []).join(", ")}</td></tr>`))
           .concat(["</tbody></table>"])
           .join("");
-
         document.getElementById("tradeTable").innerHTML = html;
       }
 
-      async function refreshAll() {
-        await Promise.all([loadOverview(), loadChart(), loadTrades()]);
+      async function loadReport() {
+        const mode = document.getElementById("reportMode").value;
+        const d = await (await fetch(`/api/report?mode=${mode}`)).json();
+        const top = (d.top_reasons || []).map(([k, v]) => `${k}(${v})`).join(", ") || "-";
+        document.getElementById("reportBox").innerHTML = `
+          <div class="cards account-cards">
+            <div class="card"><div class="k">기간</div><div class="v">${d.mode}</div></div>
+            <div class="card"><div class="k">거래 수</div><div class="v">${d.count}</div></div>
+            <div class="card"><div class="k">매수/매도</div><div class="v">${d.buy} / ${d.sell}</div></div>
+            <div class="card"><div class="k">손절 이벤트</div><div class="v">${d.stop}</div></div>
+          </div>
+          <div class="panel mini"><div class="k">주요 사유</div><div class="v">${top}</div></div>
+        `;
       }
+
+      async function loadNews() {
+        const d = await (await fetch(`/api/news`)).json();
+        const r = d.risk || {};
+        document.getElementById("newsMeta").textContent = `risk_score=${r.risk_score ?? "-"} · source=${r.source ?? "-"} · updated=${r.updated_at ?? "-"}`;
+        const items = d.items || [];
+        document.getElementById("newsList").innerHTML = items.length
+          ? items.map((n) => `<div class="news-item"><a href="${n.url || "#"}" target="_blank">${n.title || "(제목 없음)"}</a><p>${n.summary || ""}</p></div>`).join("")
+          : `<div class="muted">아직 저장된 뉴스 항목이 없어요. (risk 파일에 items/news 배열 추가 가능)</div>`;
+      }
+
+      async function loadAccount() {
+        const d = await (await fetch(`/api/account?market=${market}`)).json();
+        const a = d.account || {};
+        const rt = d.runtime || {};
+        const cards = [
+          ["연결 상태", a.connected ? "connected" : "disconnected"],
+          ["KRW 잔고", a.krw_balance ? `${num(a.krw_balance)} KRW` : "-"],
+          ["코인 수량", a.coin_balance ?? "-"],
+          ["평균단가", a.avg_buy_price ? `${num(a.avg_buy_price)} KRW` : "-"],
+          ["코인 평가금액", a.coin_value ? `${num(a.coin_value)} KRW` : "-"],
+          ["총자산", a.equity ? `${num(a.equity)} KRW` : "-"],
+          ["DD Halt", rt.halted ? `ON (${rt.halt_reason || ""})` : "OFF"],
+          ["연간 stop 수", rt.yearly_stop_count ?? 0],
+        ];
+        document.getElementById("accountGrid").innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+      }
+
+      async function refreshAll() {
+        await Promise.all([loadOverview(), loadChart(), loadTrades(), loadReport(), loadNews(), loadAccount()]);
+      }
+
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+          document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById(btn.dataset.tab).classList.add("active");
+          chart.applyOptions({ width: chartEl.clientWidth });
+        });
+      });
 
       document.getElementById("refreshBtn").addEventListener("click", refreshAll);
       document.getElementById("interval").addEventListener("change", loadChart);
+      document.getElementById("reportMode").addEventListener("change", loadReport);
 
-      window.addEventListener("resize", () => {
-        chart.applyOptions({ width: chartEl.clientWidth });
-      });
+      window.addEventListener("resize", () => chart.applyOptions({ width: chartEl.clientWidth }));
 
       refreshAll();
       setInterval(loadOverview, 15000);
       setInterval(loadTrades, 20000);
+      setInterval(loadAccount, 20000);
     </script>
   </body>
 </html>

@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pyupbit
@@ -12,6 +12,7 @@ load_dotenv()
 APP_ROOT = Path(__file__).resolve().parent
 LOG_PATH = APP_ROOT / "logs" / "trade_journal.jsonl"
 RISK_PATH = APP_ROOT / "logs" / "market_risk.json"
+RUNTIME_PATH = APP_ROOT / "logs" / "runtime_state.json"
 
 MARKET = os.getenv("MARKET", "KRW-BTC")
 
@@ -188,6 +189,86 @@ def api_trades():
             }
         )
     return jsonify({"rows": out})
+
+
+def _report_summary(mode: str):
+    rows = _read_jsonl(LOG_PATH)
+    now = datetime.now()
+    if mode == "daily":
+        start = datetime(now.year, now.month, now.day)
+    elif mode == "weekly":
+        start = now - timedelta(days=7)
+    else:
+        start = datetime(now.year, now.month, 1)
+
+    selected = [r for r in rows if datetime.fromtimestamp(int(r.get("ts", 0))) >= start]
+    buy = sum(1 for r in selected if r.get("side") in ("buy", "buy_addon"))
+    sell = sum(1 for r in selected if r.get("side") == "sell")
+    stop = sum(1 for r in selected if r.get("stop_event"))
+
+    reason_counts = {}
+    for r in selected:
+        for reason in r.get("reasons", []):
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return {
+        "mode": mode,
+        "count": len(selected),
+        "buy": buy,
+        "sell": sell,
+        "stop": stop,
+        "top_reasons": top_reasons,
+    }
+
+
+@app.route("/api/report")
+def api_report():
+    mode = request.args.get("mode", "daily")
+    if mode not in ("daily", "weekly", "monthly"):
+        mode = "daily"
+    return jsonify(_report_summary(mode))
+
+
+@app.route("/api/news")
+def api_news():
+    news = []
+    risk_meta = {"risk_score": None, "source": "none", "updated_at": None}
+    if RISK_PATH.exists():
+        try:
+            data = json.loads(RISK_PATH.read_text(encoding="utf-8"))
+            risk_meta = {
+                "risk_score": data.get("risk_score"),
+                "source": data.get("source", "file"),
+                "updated_at": data.get("updated_at"),
+            }
+            raw_news = data.get("news") or data.get("items") or []
+            if isinstance(raw_news, list):
+                for n in raw_news[:10]:
+                    if isinstance(n, dict):
+                        news.append({
+                            "title": n.get("title", ""),
+                            "url": n.get("url", ""),
+                            "summary": n.get("summary", n.get("description", "")),
+                        })
+                    else:
+                        news.append({"title": str(n), "url": "", "summary": ""})
+        except Exception:
+            pass
+    return jsonify({"risk": risk_meta, "items": news})
+
+
+@app.route("/api/account")
+def api_account():
+    market = request.args.get("market", MARKET)
+    account = _account_snapshot(market)
+    runtime = {}
+    if RUNTIME_PATH.exists():
+        try:
+            runtime = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            runtime = {}
+    return jsonify({"account": account, "runtime": runtime})
 
 
 if __name__ == "__main__":
