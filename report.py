@@ -34,14 +34,23 @@ def summarize(rows):
     reason_counter = Counter()
     block_counter = Counter()
     timeout_count = 0
+    block_event_count = 0
     for r in rows:
+        row_side = r.get("side", "")
         reasons = r.get("reasons", []) or []
+
+        if row_side == "ops_timeout":
+            timeout_count += 1
+        if row_side == "signal_block":
+            block_event_count += 1
+            for x in reasons:
+                if isinstance(x, str):
+                    block_counter[x] += 1
+
         for x in reasons:
             reason_counter[x] += 1
             if isinstance(x, str) and (x.endswith("_block") or "_block(" in x or "blocked" in x):
                 block_counter[x] += 1
-            if isinstance(x, str) and "pending_order_timeout" in x:
-                timeout_count += 1
 
     partial_tp_count = side.get("sell_partial", 0)
 
@@ -64,6 +73,7 @@ def summarize(rows):
         "sell_partial": partial_tp_count,
         "stop_count": len(stop_rows),
         "pending_timeout_count": timeout_count,
+        "signal_block_count": block_event_count,
         "top_reasons": reason_counter.most_common(8),
         "block_reasons": block_counter.most_common(8),
         "tips": tips,
@@ -74,7 +84,7 @@ def fmt(title, s):
     lines = [
         f"[{title}]",
         f"trades={s['count']} buy={s['buy']} addon={s['buy_addon']} partial_tp={s['sell_partial']} sell={s['sell']} stop={s['stop_count']}",
-        f"ops_kpi: pending_timeout={s['pending_timeout_count']}",
+        f"ops_kpi: pending_timeout={s['pending_timeout_count']} signal_block={s['signal_block_count']}",
     ]
     if s["top_reasons"]:
         lines.append("top_reasons: " + ", ".join(f"{k}({v})" for k, v in s["top_reasons"]))

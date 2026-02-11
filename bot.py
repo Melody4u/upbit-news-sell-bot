@@ -631,6 +631,8 @@ def run():
     runtime_state = load_runtime_state(runtime_state_path)
     last_action_ts = float(runtime_state.get("last_action_ts", 0.0) or 0.0)
     last_signal_hash = str(runtime_state.get("last_signal_hash", "") or "")
+    last_block_hash = str(runtime_state.get("last_block_hash", "") or "")
+    last_block_ts = float(runtime_state.get("last_block_ts", 0.0) or 0.0)
     pending_order = runtime_state.get("pending_order")
     last_buy_stop_price = runtime_state.get("last_buy_stop_price")
     if last_buy_stop_price is not None:
@@ -692,7 +694,17 @@ def run():
                 else:
                     logging.info("pending order wait | side=%s state=%s age=%ss", pending_order.get("side"), st, age_sec)
                     if age_sec >= pending_order_timeout_sec and not pending_order.get("timeout_notified", False):
-                        notify_event(alert_webhook_url, alert_events, "rejected", f"pending_order_timeout side={pending_order.get('side')} age={age_sec}s state={st}")
+                        msg = f"pending_order_timeout side={pending_order.get('side')} age={age_sec}s state={st}"
+                        notify_event(alert_webhook_url, alert_events, "rejected", msg)
+                        append_trade_log(trade_log_path, {
+                            "ts": int(time.time()),
+                            "side": "ops_timeout",
+                            "market": market,
+                            "price": current_price,
+                            "score": 0,
+                            "reasons": [msg],
+                            "dry_run": dry_run,
+                        })
                         pending_order["timeout_notified"] = True
 
             # 자본곡선/킬스위치 관리
@@ -720,6 +732,8 @@ def run():
             runtime_state["last_buy_ts"] = float(last_buy_ts)
             runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
             runtime_state["trailing_peak_price"] = float(trailing_peak_price)
+            runtime_state["last_block_hash"] = last_block_hash
+            runtime_state["last_block_ts"] = float(last_block_ts)
             save_runtime_state(runtime_state_path, runtime_state)
 
             if runtime_state.get("halted", False):
@@ -820,6 +834,8 @@ def run():
 
             should_sell = signal_score >= active_signal_threshold and coin_balance > 0
             should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
+            intended_sell = should_sell
+            intended_buy = should_buy
 
             # 진입 확정: breakout 조건 결합 방식(and/or) 파라미터화
             if entry_mode == "confirm_breakout":
@@ -931,6 +947,24 @@ def run():
                 should_buy = False
                 buy_reasons.append(f"max_position_block({max_position_krw:.0f})")
 
+            # 차단된 신호 별도 기록(운영 KPI용)
+            blocked_reasons = [r for r in (signal_reasons + buy_reasons) if ("block" in str(r))]
+            if (intended_buy or intended_sell) and (not should_buy and not should_sell) and blocked_reasons:
+                blocked_side = "buy" if intended_buy else "sell"
+                block_hash = make_signal_hash(f"block_{blocked_side}", blocked_reasons, int(signal_score if blocked_side == "sell" else buy_score), market)
+                if block_hash != last_block_hash or (time.time() - last_block_ts) > 60:
+                    append_trade_log(trade_log_path, {
+                        "ts": int(time.time()),
+                        "side": "signal_block",
+                        "market": market,
+                        "price": current_price,
+                        "score": int(signal_score if blocked_side == "sell" else buy_score),
+                        "reasons": blocked_reasons,
+                        "dry_run": dry_run,
+                    })
+                    last_block_hash = block_hash
+                    last_block_ts = time.time()
+
             logging.info(
                 "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f atr=%.2f%% spread=%.1fbps price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
                 risk_mode,
@@ -1016,6 +1050,8 @@ def run():
                 runtime_state["last_buy_ts"] = float(last_buy_ts)
                 runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
                 runtime_state["trailing_peak_price"] = float(trailing_peak_price)
+                runtime_state["last_block_hash"] = last_block_hash
+                runtime_state["last_block_ts"] = float(last_block_ts)
                 save_runtime_state(runtime_state_path, runtime_state)
                 time.sleep(check_seconds)
                 continue
