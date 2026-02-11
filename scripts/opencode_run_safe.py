@@ -27,7 +27,7 @@ def main() -> int:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("-p", "--prompt", help="Prompt text")
     src.add_argument("-f", "--file", help="Prompt file path (utf-8)")
-    p.add_argument("--timeout", type=int, default=180, help="Timeout seconds (default: 180)")
+    p.add_argument("--timeout", type=int, default=300, help="Timeout seconds (default: 300, use 0 for no timeout)")
     args = p.parse_args()
 
     prompt = args.prompt
@@ -45,7 +45,7 @@ def main() -> int:
             input=prompt,
             text=True,
             capture_output=True,
-            timeout=args.timeout,
+            timeout=(None if args.timeout <= 0 else args.timeout),
             encoding="utf-8",
             errors="replace",
         )
