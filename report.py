@@ -43,9 +43,6 @@ def summarize(rows):
             timeout_count += 1
         if row_side == "signal_block":
             block_event_count += 1
-            for x in reasons:
-                if isinstance(x, str):
-                    block_counter[x] += 1
 
         for x in reasons:
             reason_counter[x] += 1
