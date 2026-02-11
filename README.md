@@ -57,6 +57,7 @@ python dashboard.py
 - 분할 익절: `PARTIAL_TP_LEVELS` / `PARTIAL_TP_RATIOS` 기반 단계적 부분청산
 - ATR 레짐 필터(`ATR_REGIME_MIN_PCT`, `ATR_REGIME_MAX_PCT`) + 잔여물량 트레일링 스탑(`TRAILING_*`)
 - 운영 알림 웹훅(`ALERT_WEBHOOK_URL`, `ALERT_EVENTS`)
+- 실험/롤백 템플릿: `docs/EXPERIMENT_TEMPLATE.md`, `docs/ROLLBACK_POLICY.md`
 - 브레이크아웃 게이트 결합 방식 파라미터화(`BREAKOUT_GATE_MODE=and|or`)
 - EMA/ADX, Donchian, ATR, RSI, 거래량 보조 시그널
 - 뉴스 리스크 반영(네거티브 뉴스 점수)
