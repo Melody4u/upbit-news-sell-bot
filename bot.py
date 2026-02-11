@@ -556,6 +556,11 @@ def run():
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
     partial_tp_levels = partial_tp_levels[:n_tp]
     partial_tp_ratios = partial_tp_ratios[:n_tp]
+    sum_ratios = sum(max(0.0, r) for r in partial_tp_ratios)
+    if sum_ratios > 1.0:
+        scale = 1.0 / sum_ratios
+        partial_tp_ratios = [max(0.0, r) * scale for r in partial_tp_ratios]
+        logging.warning("PARTIAL_TP ratio sum > 1.0 | normalized with scale=%.4f", scale)
     atr_regime_min_pct = get_env_float("ATR_REGIME_MIN_PCT", 0.6)
     atr_regime_max_pct = get_env_float("ATR_REGIME_MAX_PCT", 4.0)
     trailing_stop_mode = os.getenv("TRAILING_STOP_MODE", "atr").lower()
@@ -686,8 +691,9 @@ def run():
                     logging.warning("pending order check error: %s", order_obj)
                 else:
                     logging.info("pending order wait | side=%s state=%s age=%ss", pending_order.get("side"), st, age_sec)
-                    if age_sec >= pending_order_timeout_sec:
+                    if age_sec >= pending_order_timeout_sec and not pending_order.get("timeout_notified", False):
                         notify_event(alert_webhook_url, alert_events, "rejected", f"pending_order_timeout side={pending_order.get('side')} age={age_sec}s state={st}")
+                        pending_order["timeout_notified"] = True
 
             # 자본곡선/킬스위치 관리
             runtime_state["equity_peak"] = max(float(runtime_state.get("equity_peak", 0.0)), equity)
@@ -987,7 +993,7 @@ def run():
                                 logging.warning("sell_partial result: %s", result)
                                 order_uuid = result.get("uuid") if isinstance(result, dict) else None
                                 if order_uuid:
-                                    pending_order = {"uuid": order_uuid, "side": "sell_partial", "created_ts": now_ts}
+                                    pending_order = {"uuid": order_uuid, "side": "sell_partial", "created_ts": now_ts, "timeout_notified": False}
                                 time.sleep(1.0)
                                 after_coin, _, _ = get_account_state(upbit, market)
                                 after_krw = get_krw_balance(upbit)
@@ -1052,7 +1058,7 @@ def run():
                         result = place_order_with_retry("sell_market_order", upbit.sell_market_order, market, sell_amount_coin)
                         logging.warning("sell_market_order result: %s", result)
                         order_uuid = result.get("uuid") if isinstance(result, dict) else None
-                        pending_order = {"uuid": order_uuid, "side": "sell", "created_ts": now_ts} if order_uuid else None
+                        pending_order = {"uuid": order_uuid, "side": "sell", "created_ts": now_ts, "timeout_notified": False} if order_uuid else None
                         time.sleep(1.0)
                         after_coin, _, _ = get_account_state(upbit, market)
                         after_krw = get_krw_balance(upbit)
@@ -1099,7 +1105,7 @@ def run():
                         result = place_order_with_retry("buy_market_order", upbit.buy_market_order, market, buy_krw)
                         logging.warning("buy_market_order result: %s", result)
                         order_uuid = result.get("uuid") if isinstance(result, dict) else None
-                        pending_order = {"uuid": order_uuid, "side": "buy", "created_ts": now_ts} if order_uuid else None
+                        pending_order = {"uuid": order_uuid, "side": "buy", "created_ts": now_ts, "timeout_notified": False} if order_uuid else None
                         time.sleep(1.0)
                         after_coin, _, _ = get_account_state(upbit, market)
                         after_krw = get_krw_balance(upbit)
@@ -1124,8 +1130,19 @@ def run():
                 retest_band = active_box_high * box_buffer_pct
                 retest_hit = abs(current_price - active_box_high) <= retest_band
                 retest_hold = (last_close >= active_box_high) and (last_close >= metrics["ma20"])
-                if retest_hit and retest_hold and krw_balance >= min_buy_krw:
+
+                addon_allowed = True
+                if spread_bps_max > 0 and spread_bps > spread_bps_max:
+                    addon_allowed = False
+                if atr_pct < atr_regime_min_pct or atr_pct > atr_regime_max_pct:
+                    addon_allowed = False
+                if last_buy_ts > 0 and (time.time() - last_buy_ts) < entry_cooldown_sec:
+                    addon_allowed = False
+
+                if retest_hit and retest_hold and addon_allowed and krw_balance >= min_buy_krw:
                     addon_krw = krw_balance * addon_ratio
+                    if max_position_krw > 0 and (coin_value_krw + addon_krw) > max_position_krw:
+                        addon_krw = max(0.0, max_position_krw - coin_value_krw)
                     if addon_krw >= min_buy_krw:
                         logging.warning("ADD-ON BUY | box_retest level=%.0f krw=%.0f", active_box_high, addon_krw)
                         append_trade_log(trade_log_path, {
@@ -1141,6 +1158,7 @@ def run():
                             notify_event(alert_webhook_url, alert_events, "order_sent", f"buy_addon sent {market} krw={addon_krw:.0f}")
                             result = place_order_with_retry("buy_addon_market_order", upbit.buy_market_order, market, addon_krw)
                             logging.warning("buy_addon result: %s", result)
+                        last_buy_ts = now_ts
                         runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         addon_done = True
 
