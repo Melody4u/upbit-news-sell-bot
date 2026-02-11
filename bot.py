@@ -579,9 +579,12 @@ def run():
     max_drawdown_pct = get_env_float("MAX_DRAWDOWN_PCT", 0.10)
     max_yearly_stop_count = get_env_int("MAX_YEARLY_STOP_COUNT", 3)
     max_daily_loss_pct = get_env_float("MAX_DAILY_LOSS_PCT", 0.03)
+    max_consecutive_losses = get_env_int("MAX_CONSECUTIVE_LOSSES", 0)
     max_trades_per_day = get_env_int("MAX_TRADES_PER_DAY", 20)
     max_position_krw = get_env_float("MAX_POSITION_KRW", 0)
+    max_position_fraction = get_env_float("MAX_POSITION_FRACTION", 0.0)
     max_slippage_bps = get_env_float("MAX_SLIPPAGE_BPS", 30)
+    risk_per_trade = get_env_float("RISK_PER_TRADE", 0.0)
     alert_webhook_url = os.getenv("ALERT_WEBHOOK_URL", "").strip()
     alert_events = set(x.strip() for x in os.getenv("ALERT_EVENTS", "order_sent,filled,rejected,halted,resume").split(",") if x.strip())
     pending_order_timeout_sec = get_env_int("PENDING_ORDER_TIMEOUT_SEC", 180)
@@ -681,6 +684,7 @@ def run():
                 runtime_state["day_key"] = day_key
                 runtime_state["day_start_equity"] = equity
                 runtime_state["trades_today"] = 0
+                runtime_state["consecutive_losses_today"] = 0
 
             # 재시작 내구성: 대기 주문 상태 조회
             if pending_order and isinstance(pending_order, dict) and pending_order.get("uuid"):
@@ -723,6 +727,9 @@ def run():
             if int(runtime_state.get("yearly_stop_count", 0)) >= max_yearly_stop_count:
                 runtime_state["halted"] = True
                 runtime_state["halt_reason"] = f"yearly_stop_count_reached({runtime_state.get('yearly_stop_count', 0)})"
+            if max_consecutive_losses > 0 and int(runtime_state.get("consecutive_losses_today", 0)) >= max_consecutive_losses:
+                runtime_state["halted"] = True
+                runtime_state["halt_reason"] = f"max_consecutive_losses_reached({runtime_state.get('consecutive_losses_today', 0)})"
 
             # 상태 저장(복구용 핵심 필드)
             runtime_state["last_action_ts"] = float(last_action_ts)
@@ -943,9 +950,14 @@ def run():
                         should_sell = False
                     logging.warning("signal blocked by max_trades_per_day=%s", max_trades_per_day)
 
-            if should_buy and max_position_krw > 0 and (coin_value_krw + (krw_balance * min(probe_entry_ratio if entry_mode == 'confirm_breakout' else active_buy_ratio, active_buy_ratio))) > max_position_krw:
+            effective_max_position_krw = max_position_krw if max_position_krw > 0 else 0.0
+            if max_position_fraction > 0:
+                frac_cap = equity * max_position_fraction
+                effective_max_position_krw = frac_cap if effective_max_position_krw <= 0 else min(effective_max_position_krw, frac_cap)
+
+            if should_buy and effective_max_position_krw > 0 and (coin_value_krw + (krw_balance * min(probe_entry_ratio if entry_mode == 'confirm_breakout' else active_buy_ratio, active_buy_ratio))) > effective_max_position_krw:
                 should_buy = False
-                buy_reasons.append(f"max_position_block({max_position_krw:.0f})")
+                buy_reasons.append(f"max_position_block({effective_max_position_krw:.0f})")
 
             # 차단된 신호 별도 기록(운영 KPI용)
             blocked_reasons = [r for r in (signal_reasons + buy_reasons) if ("block" in str(r))]
@@ -1088,6 +1100,11 @@ def run():
                         last_action_ts = now_ts
                         last_signal_hash = signal_hash
                         runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                        loss_hit = current_price < (avg_buy_price * 0.998) if avg_buy_price > 0 else False
+                        if loss_hit:
+                            runtime_state["consecutive_losses_today"] = int(runtime_state.get("consecutive_losses_today", 0)) + 1
+                        else:
+                            runtime_state["consecutive_losses_today"] = 0
                     else:
                         before_coin, before_krw = coin_balance, krw_balance
                         notify_event(alert_webhook_url, alert_events, "order_sent", f"sell sent {market} amount={sell_amount_coin:.8f}")
@@ -1104,6 +1121,11 @@ def run():
                             last_action_ts = now_ts
                             last_signal_hash = signal_hash
                             runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                            loss_hit = current_price < (avg_buy_price * 0.998) if avg_buy_price > 0 else False
+                            if loss_hit:
+                                runtime_state["consecutive_losses_today"] = int(runtime_state.get("consecutive_losses_today", 0)) + 1
+                            else:
+                                runtime_state["consecutive_losses_today"] = 0
                             notify_event(alert_webhook_url, alert_events, "filled", f"sell filled {market} price={current_price:.0f}")
                             pending_order = None
                         elif order_uuid is None:
@@ -1112,6 +1134,14 @@ def run():
             elif should_buy:
                 base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else active_buy_ratio
                 buy_krw = krw_balance * min(base_ratio, active_buy_ratio)
+
+                # Optional risk-based sizing (uses stop distance from RR filter block)
+                if risk_per_trade > 0 and stop_price > 0 and last_close > stop_price:
+                    risk_budget_krw = equity * risk_per_trade
+                    stop_pct = max(1e-6, (last_close - stop_price) / last_close)
+                    buy_krw_risk = risk_budget_krw / stop_pct
+                    buy_krw = min(buy_krw, buy_krw_risk, krw_balance)
+
                 if buy_krw < min_buy_krw:
                     logging.warning("buy skipped | below min_buy_krw: %.0f < %.0f", buy_krw, min_buy_krw)
                 else:
@@ -1177,8 +1207,8 @@ def run():
 
                 if retest_hit and retest_hold and addon_allowed and krw_balance >= min_buy_krw:
                     addon_krw = krw_balance * addon_ratio
-                    if max_position_krw > 0 and (coin_value_krw + addon_krw) > max_position_krw:
-                        addon_krw = max(0.0, max_position_krw - coin_value_krw)
+                    if effective_max_position_krw > 0 and (coin_value_krw + addon_krw) > effective_max_position_krw:
+                        addon_krw = max(0.0, effective_max_position_krw - coin_value_krw)
                     if addon_krw >= min_buy_krw:
                         logging.warning("ADD-ON BUY | box_retest level=%.0f krw=%.0f", active_box_high, addon_krw)
                         append_trade_log(trade_log_path, {
