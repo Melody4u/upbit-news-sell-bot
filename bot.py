@@ -3,7 +3,6 @@ import time
 import json
 import logging
 import hashlib
-from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
 import requests
@@ -12,92 +11,20 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 
-
-NEGATIVE_KEYWORDS = [
-    "hack", "해킹", "제재", "금지", "소송", "파산", "상장폐지", "투자주의", "규제", "investigation"
-]
-
-
-@dataclass
-class NewsState:
-    last_checked: float = 0.0
-    negative_score: int = 0
-    headlines: List[str] = None
-
-    def __post_init__(self):
-        if self.headlines is None:
-            self.headlines = []
-
-
-def env_bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).lower() in ("1", "true", "yes", "y")
-
-
-def get_env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def get_env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def setup_logger() -> None:
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-
-
-def fetch_negative_news_score(
-    brave_api_key: str,
-    query: str,
-    country: str,
-    lang: str,
-    count: int,
-) -> Tuple[int, List[str]]:
-    if not brave_api_key:
-        return 0, []
-
-    url = "https://api.search.brave.com/res/v1/web/search"
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": brave_api_key,
-    }
-    params = {
-        "q": query,
-        "count": count,
-        "country": country,
-        "search_lang": lang,
-        "freshness": "pd",
-    }
-
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    items = data.get("web", {}).get("results", [])
-    texts = []
-    for item in items:
-        title = item.get("title", "") or ""
-        desc = item.get("description", "") or ""
-        combined = f"{title} {desc}".strip()
-        if combined:
-            texts.append(combined)
-
-    score = 0
-    for text in texts:
-        lowered = text.lower()
-        if any(k.lower() in lowered for k in NEGATIVE_KEYWORDS):
-            score += 1
-
-    return score, texts[:5]
+from tradingbot.config import env_bool, get_env_float, get_env_int, parse_float_list_csv
+from tradingbot.log_setup import setup_logger
+from tradingbot.logging.trade_log import append_trade_log
+from tradingbot.state.runtime_state import load_runtime_state, save_runtime_state
+from tradingbot.data.exchange_client import (
+    get_account_state,
+    get_krw_balance,
+    get_spread_bps,
+    get_order_state,
+)
+from tradingbot.execution.broker import place_order_with_retry, verify_position_change
+from tradingbot.notifications import notify_event
+from tradingbot.risk.news import NewsState, fetch_negative_news_score
+from tradingbot.risk.market_risk import load_market_risk, resolve_risk_mode, apply_risk_mode
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -138,56 +65,7 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx.fillna(0)
 
 
-def get_account_state(upbit, market: str):
-    balances = upbit.get_balances()
-    base = market.split("-")[1]
-
-    coin_balance = 0.0
-    avg_buy_price = 0.0
-    for b in balances:
-        if b.get("currency") == base:
-            coin_balance = float(b.get("balance") or 0)
-            avg_buy_price = float(b.get("avg_buy_price") or 0)
-            break
-
-    current_price = pyupbit.get_current_price(market)
-    if current_price is None:
-        raise RuntimeError("현재가 조회 실패")
-
-    return coin_balance, avg_buy_price, float(current_price)
-
-
-def get_krw_balance(upbit) -> float:
-    krw = upbit.get_balance("KRW")
-    return float(krw or 0)
-
-
-def get_spread_bps(market: str) -> float:
-    try:
-        ob = pyupbit.get_orderbook(market)
-        if isinstance(ob, list):
-            ob = ob[0] if ob else None
-        if not ob:
-            return 0.0
-        units = ob.get("orderbook_units", [])
-        if not units:
-            return 0.0
-        ask = float(units[0].get("ask_price") or 0)
-        bid = float(units[0].get("bid_price") or 0)
-        mid = (ask + bid) / 2 if (ask > 0 and bid > 0) else 0
-        if mid <= 0:
-            return 0.0
-        return ((ask - bid) / mid) * 10000
-    except Exception:
-        return 0.0
-
-
-def parse_float_list_csv(s: str, default: List[float]) -> List[float]:
-    try:
-        vals = [float(x.strip()) for x in (s or "").split(",") if x.strip()]
-        return vals if vals else default
-    except Exception:
-        return default
+# (moved) exchange client + config helpers -> tradingbot.data.exchange_client / tradingbot.config
 
 
 def build_stop_feedback(reasons: List[str]) -> str:
@@ -206,84 +84,11 @@ def build_stop_feedback(reasons: List[str]) -> str:
     return " / ".join(tips)
 
 
-def append_trade_log(path: str, payload: Dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+# (moved) append_trade_log -> tradingbot.logging.trade_log
+# (moved) market risk helpers -> tradingbot.risk.market_risk
 
 
-def load_market_risk(path: str) -> Dict:
-    if not path or not os.path.exists(path):
-        return {"risk_score": None, "source": "none"}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        score = data.get("risk_score")
-        if score is None:
-            return {"risk_score": None, "source": "file_missing_score"}
-        score = max(0.0, min(100.0, float(score)))
-        return {"risk_score": score, "source": data.get("source", "file")}
-    except Exception:
-        return {"risk_score": None, "source": "file_error"}
-
-
-def resolve_risk_mode(risk_score: float, cfg: Dict[str, float]) -> str:
-    if risk_score >= cfg["RISK_CONSERVATIVE_MIN"]:
-        return "conservative"
-    if risk_score <= cfg["RISK_AGGRESSIVE_MAX"]:
-        return "aggressive"
-    return "neutral"
-
-
-def apply_risk_mode(mode: str, base: Dict[str, float], cfg: Dict[str, float]) -> Dict[str, float]:
-    tuned = dict(base)
-    if mode == "aggressive":
-        tuned["signal_score_threshold"] = cfg["AGG_SIGNAL_SCORE_THRESHOLD"]
-        tuned["buy_score_threshold"] = cfg["AGG_BUY_SCORE_THRESHOLD"]
-        tuned["sell_ratio"] = cfg["AGG_SELL_RATIO"]
-        tuned["buy_ratio"] = cfg["AGG_BUY_RATIO"]
-    elif mode == "conservative":
-        tuned["signal_score_threshold"] = cfg["CONS_SIGNAL_SCORE_THRESHOLD"]
-        tuned["buy_score_threshold"] = cfg["CONS_BUY_SCORE_THRESHOLD"]
-        tuned["sell_ratio"] = cfg["CONS_SELL_RATIO"]
-        tuned["buy_ratio"] = cfg["CONS_BUY_RATIO"]
-    return tuned
-
-
-def load_runtime_state(path: str) -> Dict:
-    base = {
-        "equity_peak": 0.0,
-        "year": time.localtime().tm_year,
-        "yearly_stop_count": 0,
-        "halted": False,
-        "halt_reason": "",
-        "last_action_ts": 0.0,
-        "last_signal_hash": "",
-        "pending_order": None,
-        "last_buy_stop_price": None,
-        "last_buy_ts": 0.0,
-        "partial_tp_done": [],
-        "trailing_peak_price": 0.0,
-        "day_key": time.strftime("%Y-%m-%d"),
-        "day_start_equity": 0.0,
-        "trades_today": 0,
-    }
-    if not os.path.exists(path):
-        return base
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            base.update(loaded)
-        return base
-    except Exception:
-        return base
-
-
-def save_runtime_state(path: str, state: Dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+# (moved) runtime state IO -> tradingbot.state.runtime_state
 
 
 def is_stop_loss_event(reasons: List[str]) -> bool:
@@ -292,16 +97,7 @@ def is_stop_loss_event(reasons: List[str]) -> bool:
     return any(k in text for k in keys)
 
 
-def place_order_with_retry(action_name: str, fn, *args, retries: int = 3, delay_sec: float = 1.0):
-    last_err = None
-    for i in range(retries):
-        try:
-            return fn(*args)
-        except Exception as e:
-            last_err = e
-            logging.warning("%s failed (%s/%s): %s", action_name, i + 1, retries, e)
-            time.sleep(delay_sec * (2 ** i))
-    raise RuntimeError(f"{action_name} failed after retries: {last_err}")
+# (moved) place_order_with_retry -> tradingbot.execution.broker
 
 
 def make_signal_hash(side: str, reasons: List[str], score: int, market: str) -> str:
@@ -309,38 +105,13 @@ def make_signal_hash(side: str, reasons: List[str], score: int, market: str) -> 
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def verify_position_change(before_coin: float, before_krw: float, after_coin: float, after_krw: float, side: str) -> bool:
-    if side == "buy":
-        return (after_coin > before_coin) or (after_krw < before_krw)
-    if side == "sell":
-        return (after_coin < before_coin) or (after_krw > before_krw)
-    return False
+# (moved) verify_position_change -> tradingbot.execution.broker
 
 
-def notify_event(webhook_url: str, enabled_events: set, event_name: str, message: str) -> None:
-    if not webhook_url or event_name not in enabled_events:
-        return
-    for attempt in range(2):
-        try:
-            requests.post(webhook_url, json={"event": event_name, "text": message}, timeout=5)
-            return
-        except Exception as e:
-            if attempt == 1:
-                logging.warning("notify failed(%s): %s", event_name, e)
-            else:
-                time.sleep(0.4)
+# (moved) notify_event -> tradingbot.notifications
 
 
-def get_order_state(upbit, uuid: str):
-    try:
-        o = upbit.get_order(uuid)
-        if isinstance(o, dict):
-            return o.get("state", "unknown"), o
-        if isinstance(o, list) and o:
-            return o[0].get("state", "unknown"), o[0]
-        return "unknown", o
-    except Exception as e:
-        return "error", {"error": str(e)}
+# (moved) get_order_state -> tradingbot.data.exchange_client
 
 
 def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, float], mtf_trend_ok: bool = True) -> Tuple[int, List[str], Dict[str, float]]:
