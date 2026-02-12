@@ -546,6 +546,35 @@ def run():
     mtf_interval = os.getenv("MTF_TREND_INTERVAL", "minute30")
     mtf_interval_2 = os.getenv("MTF_TREND_INTERVAL_2", "minute240")
     mtf_lookback = get_env_int("MTF_TREND_LOOKBACK", 120)
+
+    # --- MTF score sizing (Phase A)
+    enable_mtf_score_sizing = env_bool("ENABLE_MTF_SCORE_SIZING", True)
+    minute_consensus_intervals = [s.strip() for s in os.getenv("MINUTE_CONSENSUS_INTERVALS", "minute3,minute5,minute15").split(",") if s.strip()]
+    hour_score_weights = {
+        "minute30": get_env_int("HOUR_MTF_WEIGHT_M30", 15),
+        "minute60": get_env_int("HOUR_MTF_WEIGHT_H1", 20),
+        "minute240": get_env_int("HOUR_MTF_WEIGHT_H4", 30),
+        "day": get_env_int("HOUR_MTF_WEIGHT_D1", 20),
+        "week": get_env_int("HOUR_MTF_WEIGHT_W1", 15),
+    }
+    # score -> stage sizing (equity fraction)
+    mtf_stage_thresholds = {
+        "scout": get_env_int("MTF_STAGE_SCOUT_MIN", 30),
+        "light": get_env_int("MTF_STAGE_LIGHT_MIN", 50),
+        "medium": get_env_int("MTF_STAGE_MEDIUM_MIN", 65),
+        "heavy": get_env_int("MTF_STAGE_HEAVY_MIN", 80),
+    }
+    mtf_stage_pcts = {
+        "scout": get_env_float("MTF_STAGE_SCOUT_PCT", 0.01),
+        "light": get_env_float("MTF_STAGE_LIGHT_PCT", 0.07),
+        "medium": get_env_float("MTF_STAGE_MEDIUM_PCT", 0.15),
+        "heavy": get_env_float("MTF_STAGE_HEAVY_PCT", 0.25),
+    }
+
+    # stops
+    entry_stop_atr_mult = get_env_float("ENTRY_STOP_ATR_MULT", 2.5)
+    hard_stop_pct = get_env_float("HARD_STOP_PCT", 0.10)
+
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
     spread_bps_max = get_env_float("SPREAD_BPS_MAX", 12)
@@ -783,7 +812,6 @@ def run():
 
             df_mtf = pyupbit.get_ohlcv(market, interval=mtf_interval, count=max(mtf_lookback, 220))
             df_mtf_2 = pyupbit.get_ohlcv(market, interval=mtf_interval_2, count=max(mtf_lookback, 220))
-            mtf_trend_ok = True
 
             def _mtf_ok(_df):
                 if _df is None or len(_df) < 80:
@@ -799,6 +827,41 @@ def run():
                 )
 
             mtf_trend_ok = _mtf_ok(df_mtf) and _mtf_ok(df_mtf_2)
+
+            # Phase A: minute consensus + hour MTF score (optional)
+            minute_consensus = True
+            hour_mtf_score = None
+            mtf_stage = None
+            score_based_buy_krw = None
+            if enable_mtf_score_sizing:
+                # minute consensus (3m, 5m, 15m by default)
+                minute_flags = []
+                for itv in minute_consensus_intervals:
+                    _df_itv = pyupbit.get_ohlcv(market, interval=itv, count=max(mtf_lookback, 220))
+                    minute_flags.append(_mtf_ok(_df_itv))
+                minute_consensus = all(minute_flags) if minute_flags else True
+
+                # hour score (30m, 1h, 4h, 1d, 1w)
+                hour_mtf_score = 0
+                for itv, w in hour_score_weights.items():
+                    _df_itv = pyupbit.get_ohlcv(market, interval=itv, count=max(mtf_lookback, 220))
+                    if _mtf_ok(_df_itv):
+                        hour_mtf_score += int(w)
+
+                # stage mapping
+                if hour_mtf_score >= mtf_stage_thresholds["heavy"]:
+                    mtf_stage = "heavy"
+                elif hour_mtf_score >= mtf_stage_thresholds["medium"]:
+                    mtf_stage = "medium"
+                elif hour_mtf_score >= mtf_stage_thresholds["light"]:
+                    mtf_stage = "light"
+                elif hour_mtf_score >= mtf_stage_thresholds["scout"]:
+                    mtf_stage = "scout"
+                else:
+                    mtf_stage = "none"
+
+                pct = float(mtf_stage_pcts.get(mtf_stage, 0.0)) if mtf_stage != "none" else 0.0
+                score_based_buy_krw = max(0.0, equity * pct)
 
             signal_score, signal_reasons, metrics = evaluate_signals(df, avg_buy_price, cfg, mtf_trend_ok=mtf_trend_ok)
             buy_score = int(metrics.get("buy_score", 0))
@@ -854,8 +917,27 @@ def run():
 
             should_sell = signal_score >= active_signal_threshold and coin_balance > 0
             should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
+
+            # Phase A gate: 3m/5m/15m AND consensus + hour score stage
+            if enable_mtf_score_sizing:
+                if not minute_consensus:
+                    should_buy = False
+                    buy_reasons.append("minute_mtf_no_consensus")
+                elif hour_mtf_score is not None and (score_based_buy_krw is None or score_based_buy_krw <= 0):
+                    should_buy = False
+                    buy_reasons.append(f"hour_mtf_score_low({hour_mtf_score})")
+                else:
+                    buy_reasons.append(f"minute_mtf_consensus({sum(1 for x in minute_flags if x)}/{len(minute_flags)})")
+                    if hour_mtf_score is not None:
+                        buy_reasons.append(f"hour_mtf_score({hour_mtf_score})")
+                    if mtf_stage is not None:
+                        buy_reasons.append(f"mtf_stage({mtf_stage})")
+
             intended_sell = should_sell
             intended_buy = should_buy
+
+            # emergency sell flag (for bypass/idempotency and full liquidation)
+            emergency_sell = False
 
             # 진입 확정: breakout 조건 결합 방식(and/or) 파라미터화
             if entry_mode == "confirm_breakout":
@@ -893,10 +975,19 @@ def run():
                 should_buy = False
                 buy_reasons.append("post_entry_cooldown_block")
 
-            # 진입봉 저점 이탈 손절
+            # 진입봉 저점/ATR 기반 스탑(저점 이탈 시 청산)
             if stop_by_entry_candle and coin_balance > 0 and last_buy_stop_price is not None and current_price < last_buy_stop_price:
                 should_sell = True
                 signal_reasons.append(f"entry_candle_stop({last_buy_stop_price:.0f})")
+
+            # Hard stop (최후 보험): avg_buy_price 대비 -HARD_STOP_PCT 하락 시 전량 청산
+            if coin_balance > 0 and avg_buy_price > 0 and hard_stop_pct > 0:
+                hard_stop_price = avg_buy_price * (1.0 - hard_stop_pct)
+                if current_price < hard_stop_price:
+                    should_sell = True
+                    emergency_sell = True
+                    active_sell_ratio = 1.0
+                    signal_reasons.append(f"hard_stop({hard_stop_pct*100:.1f}%)")
 
             # 멱등성/중복 주문 방지
             now_ts = time.time()
@@ -918,7 +1009,6 @@ def run():
 
             # MA22 하향 이탈 익절/청산
             ma_exit_now = float(ma_exit.iloc[-1]) if pd.notna(ma_exit.iloc[-1]) else 0.0
-            emergency_sell = False
             if take_profit_by_ma22 and coin_balance > 0 and ma_exit_now > 0 and last_close < ma_exit_now:
                 should_sell = True
                 emergency_sell = True
@@ -1148,6 +1238,10 @@ def run():
                 base_ratio = probe_entry_ratio if entry_mode == "confirm_breakout" else active_buy_ratio
                 buy_krw = krw_balance * min(base_ratio, active_buy_ratio)
 
+                # Phase A: score-based sizing (equity fraction) with existing safety min() sizing
+                if enable_mtf_score_sizing and score_based_buy_krw is not None and score_based_buy_krw > 0:
+                    buy_krw = min(buy_krw, score_based_buy_krw)
+
                 # Optional risk-based sizing (uses stop distance from RR filter block)
                 if risk_per_trade > 0 and stop_price > 0 and last_close > stop_price:
                     risk_budget_krw = equity * risk_per_trade
@@ -1177,7 +1271,9 @@ def run():
                         partial_tp_done = set()
                         runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                         if stop_by_entry_candle:
-                            last_buy_stop_price = last_low
+                            structural_stop = last_low
+                            atr_stop = (last_close - (atr_now * entry_stop_atr_mult)) if (entry_stop_atr_mult > 0 and atr_now > 0) else structural_stop
+                            last_buy_stop_price = min(structural_stop, atr_stop)
                     else:
                         before_coin, before_krw = coin_balance, krw_balance
                         notify_event(alert_webhook_url, alert_events, "order_sent", f"buy sent {market} krw={buy_krw:.0f}")
@@ -1199,7 +1295,9 @@ def run():
                             runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                             notify_event(alert_webhook_url, alert_events, "filled", f"buy filled {market} price={current_price:.0f}")
                             if stop_by_entry_candle:
-                                last_buy_stop_price = last_low
+                                structural_stop = last_low
+                                atr_stop = (last_close - (atr_now * entry_stop_atr_mult)) if (entry_stop_atr_mult > 0 and atr_now > 0) else structural_stop
+                                last_buy_stop_price = min(structural_stop, atr_stop)
                             pending_order = None
                         elif order_uuid is None:
                             notify_event(alert_webhook_url, alert_events, "rejected", f"buy rejected {market}")
