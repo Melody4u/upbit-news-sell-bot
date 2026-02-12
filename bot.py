@@ -194,15 +194,15 @@ def build_stop_feedback(reasons: List[str]) -> str:
     text = " | ".join(reasons)
     tips = []
     if "entry_candle_stop" in text:
-        tips.append("吏꾩엯遊?????먯젅 諛쒖깮: PROBE_ENTRY_RATIO瑜???텛嫄곕굹 BREAKOUT_BODY_ATR_MULT瑜??믪뿬 ??媛뺥븳 ?뚰뙆留?吏꾩엯")
+        tips.append("진입 직후 손절 발생: PROBE_ENTRY_RATIO를 낮추거나 BREAKOUT_BODY_ATR_MULT를 높여 더 강한 돌파에서만 진입")
     if "ma22_exit" in text:
-        tips.append("MA22 ?댄깉 泥?궛: MA_EXIT_PERIOD瑜?22??4~30?쇰줈 ?섎젮 怨쇰? 諛섏쓳 ?꾪솕 ?щ? ?먭?")
+        tips.append("MA22 이탈 청산 빈도 높음: MA_EXIT_PERIOD를 22→24~30으로 완화해 과민 반응 여부 점검")
     if "sideways_filter" in text:
-        tips.append("?〓낫 ?몄씠利?媛?μ꽦: SIDEWAYS_CROSS_THRESHOLD ?곹뼢 ?먮뒗 BOX ?뚰뙆 ?뺤씤 ??吏꾩엯")
+        tips.append("횡보 구간 거래 과다 가능성: SIDEWAYS_CROSS_THRESHOLD를 상향하거나 BOX 돌파 확인 후 진입")
     if "negative_news" in text:
-        tips.append("?낆옱 ?댁뒪 ?곹뼢: NEWS_INTERVAL_SECONDS ?⑥텞/?꾧퀎移?議곗젙?쇰줈 ?댁뒪 ?꾪꽣 誘쇨컧???ъ젏寃")
+        tips.append("악재 뉴스 민감도 조정: NEWS_INTERVAL_SECONDS/임계치 조정으로 뉴스 필터 과민 반응 점검")
     if not tips:
-        tips.append("理쒓렐 30~50媛??몃젅?대뱶 濡쒓렇瑜?紐⑥븘 媛????? ?먯젅 ?먯씤遺???뚮씪誘명꽣 1媛쒖뵫留?議곗젙")
+        tips.append("최근 30~50개 트레이드 로그를 모아 공통 손절 원인 확인 후 파라미터 1개씩만 조정")
     return " / ".join(tips)
 
 
@@ -650,6 +650,7 @@ def run():
     prev_halted = bool(runtime_state.get("halted", False))
 
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
+    loop_error_count = 0
 
     while True:
         try:
@@ -1237,15 +1238,27 @@ def run():
             runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
             runtime_state["trailing_peak_price"] = float(trailing_peak_price)
             save_runtime_state(runtime_state_path, runtime_state)
+            loop_error_count = 0
 
             time.sleep(check_seconds)
 
         except Exception as e:
-            pending_order = None
-            runtime_state["pending_order"] = None
+            err = str(e).lower()
+            loop_error_count += 1
+
+            # pending_order를 즉시 초기화하지 않고 보존해서 다음 루프에서 재조회/타임아웃 처리
+            runtime_state["pending_order"] = pending_order
+
+            if any(k in err for k in ["unauthorized", "invalid access key", "jwt", "forbidden", "permission"]):
+                runtime_state["halted"] = True
+                runtime_state["halt_reason"] = "auth_error"
+                notify_event(alert_webhook_url, alert_events, "halted", "auth_error: check API keys/permissions")
+
             save_runtime_state(runtime_state_path, runtime_state)
-            logging.exception("loop error: %s", e)
-            time.sleep(max(5, check_seconds))
+            logging.exception("loop error #%s: %s", loop_error_count, e)
+
+            backoff_sec = min(60, max(5, check_seconds) * (2 ** min(loop_error_count, 3)))
+            time.sleep(backoff_sec)
 
 
 if __name__ == "__main__":
