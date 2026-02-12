@@ -9,6 +9,7 @@ from typing import List, Tuple, Dict
 import requests
 import pyupbit
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
 
 
@@ -105,7 +106,7 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
@@ -127,12 +128,12 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
-    atr = compute_atr(df, period).replace(0, pd.NA)
+    atr = compute_atr(df, period).replace(0, np.nan)
 
     plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
 
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
     adx = dx.ewm(alpha=1 / period, adjust=False).mean()
     return adx.fillna(0)
 
