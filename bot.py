@@ -574,6 +574,7 @@ def run():
     # stops
     entry_stop_atr_mult = get_env_float("ENTRY_STOP_ATR_MULT", 2.5)
     hard_stop_pct = get_env_float("HARD_STOP_PCT", 0.10)
+    hard_stop_recovery_window_sec = get_env_int("HARD_STOP_RECOVERY_WINDOW_SEC", 86400)
 
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
@@ -786,10 +787,64 @@ def run():
             save_runtime_state(runtime_state_path, runtime_state)
 
             if runtime_state.get("halted", False):
+                # Special case: after hard stop, allow auto-resume within 24h if minute consensus recovers.
+                halt_reason = str(runtime_state.get("halt_reason", "unknown"))
+                can_try_resume = (halt_reason.startswith("hard_stop"))
+                hard_stop_ts = float(runtime_state.get("hard_stop_ts", 0.0) or 0.0)
+                in_window = (hard_stop_ts > 0) and ((time.time() - hard_stop_ts) <= float(hard_stop_recovery_window_sec))
+
+                if can_try_resume and in_window and enable_mtf_score_sizing:
+                    try:
+                        def _mtf_ok(_df):
+                            if _df is None or len(_df) < 80:
+                                return False
+                            _close = _df["close"]
+                            _ma50 = _close.rolling(50).mean()
+                            _ma200 = _close.rolling(200).mean()
+                            return bool(
+                                pd.notna(_ma50.iloc[-1])
+                                and pd.notna(_ma200.iloc[-1])
+                                and float(_ma50.iloc[-1]) > float(_ma200.iloc[-1])
+                                and float(_close.iloc[-1]) > float(_ma50.iloc[-1])
+                            )
+
+                        minute_flags = []
+                        for itv in minute_consensus_intervals:
+                            _df_itv = pyupbit.get_ohlcv(market, interval=itv, count=max(mtf_lookback, 220))
+                            minute_flags.append(_mtf_ok(_df_itv))
+                        minute_consensus = all(minute_flags) if minute_flags else False
+
+                        hour_mtf_score = 0
+                        for itv, w in hour_score_weights.items():
+                            _df_itv = pyupbit.get_ohlcv(market, interval=itv, count=max(mtf_lookback, 220))
+                            if _mtf_ok(_df_itv):
+                                hour_mtf_score += int(w)
+
+                        if minute_consensus and hour_mtf_score >= mtf_stage_thresholds.get("scout", 30):
+                            runtime_state["halted"] = False
+                            runtime_state["halt_reason"] = ""
+                            runtime_state["hard_stop_ts"] = 0.0
+                            save_runtime_state(runtime_state_path, runtime_state)
+                            notify_event(alert_webhook_url, alert_events, "resume", f"hard-stop recovery signal | score={hour_mtf_score}")
+                            prev_halted = False
+                        else:
+                            if not prev_halted:
+                                notify_event(alert_webhook_url, alert_events, "halted", f"halted: {halt_reason}")
+                            prev_halted = True
+                            logging.error("TRADING HALTED | reason=%s | recovery_window_remaining=%.0fs | minute=%s hour_score=%s",
+                                          halt_reason,
+                                          max(0.0, float(hard_stop_recovery_window_sec) - (time.time() - hard_stop_ts)) if hard_stop_ts > 0 else 0.0,
+                                          minute_consensus,
+                                          hour_mtf_score)
+                            time.sleep(check_seconds)
+                            continue
+                    except Exception as e:
+                        logging.warning("hard-stop recovery check failed: %s", e)
+
                 if not prev_halted:
-                    notify_event(alert_webhook_url, alert_events, "halted", f"halted: {runtime_state.get('halt_reason', 'unknown')}")
+                    notify_event(alert_webhook_url, alert_events, "halted", f"halted: {halt_reason}")
                 prev_halted = True
-                logging.error("TRADING HALTED | reason=%s", runtime_state.get("halt_reason", "unknown"))
+                logging.error("TRADING HALTED | reason=%s", halt_reason)
                 time.sleep(check_seconds)
                 continue
             elif prev_halted:
@@ -1180,9 +1235,14 @@ def run():
                 else:
                     logging.warning("SELL SIGNAL | score=%s reasons=%s", signal_score, ", ".join(signal_reasons))
                     feedback = build_stop_feedback(signal_reasons)
-                    stop_event = is_stop_loss_event(signal_reasons)
+
+                    # Stop event reporting policy (Phase A): report ONLY on hard stop
+                    stop_event = any(str(r).startswith("hard_stop") for r in signal_reasons)
                     if stop_event:
                         runtime_state["yearly_stop_count"] = int(runtime_state.get("yearly_stop_count", 0)) + 1
+                        runtime_state["hard_stop_ts"] = float(time.time())
+                        runtime_state["halted"] = True
+                        runtime_state["halt_reason"] = f"hard_stop_triggered({hard_stop_pct*100:.1f}%)"
                         save_runtime_state(runtime_state_path, runtime_state)
 
                     append_trade_log(trade_log_path, {
