@@ -590,6 +590,17 @@ def run():
     alert_events = set(x.strip() for x in os.getenv("ALERT_EVENTS", "order_sent,filled,rejected,halted,resume").split(",") if x.strip())
     pending_order_timeout_sec = get_env_int("PENDING_ORDER_TIMEOUT_SEC", 180)
 
+    # Ensure log paths exist. We also "touch" the trade journal so monitors
+    # don't error before the first trade is written.
+    for _p in [trade_log_path, runtime_state_path, market_risk_path]:
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+    try:
+        open(trade_log_path, "a", encoding="utf-8").close()
+    except Exception as e:
+        logging.warning("failed to init trade journal | path=%s err=%s", trade_log_path, e)
+
     cfg = {
         "EMA_FAST": get_env_int("EMA_FAST", 20),
         "EMA_SLOW": get_env_int("EMA_SLOW", 50),
