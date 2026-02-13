@@ -191,6 +191,10 @@ def simulate(
     risk_per_trade: float = 0.015,
     mdd_limit_pct: float = 0.30,
     downtrend_mode: str = "or",  # h4|d1|or|off
+    downtrend_early_fail_min_r: float = 1.2,
+    swing_stop_enabled: bool = True,
+    swing_stop_lookback: int = 20,
+    swing_stop_confirm_bars: int = 2,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -247,6 +251,7 @@ def simulate(
 
     # per-position accumulators
     r_total_pos = 0.0
+    swing_break_count = 0
 
     legs = []  # execution legs: early_cut/tp1/rem
     positions = []  # per-entry totals
@@ -287,6 +292,9 @@ def simulate(
             downtrend = (h4_down or d1_down) if dm == "or" else (h4_down if dm == "h4" else (d1_down if dm == "d1" else False))
             if downtrend:
                 continue
+
+            # keep for later (position management)
+            downtrend_entry = bool(downtrend)
 
             # Phase A-ish: require some MTF score (>= scout_min)
             s = score_mtf(ts, df_by_itv, weights)
@@ -419,6 +427,7 @@ def simulate(
             last_addon_i = i
             gate_hold = 0
             r_total_pos = 0.0
+            swing_break_count = 0
             entry_ctx_counts[entry_ctx] = int(entry_ctx_counts.get(entry_ctx, 0)) + 1
         else:
             low = float(row["low"])
@@ -520,6 +529,30 @@ def simulate(
                         if mode == "hybrid" and (not weak_ctx):
                             levels, ratios = slevels, sratios
 
+                        # Downtrend insurance(B): delay early-fail so it doesn't act like a tight stop
+                        # Recompute downtrend at current bar (same as entry gate)
+                        sub240_dt2 = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+                        subd1_dt2 = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+                        h4_down2 = False
+                        if sub240_dt2 is not None and not sub240_dt2.empty:
+                            c2 = sub240_dt2["close"]
+                            ma50_2 = c2.rolling(50).mean()
+                            ma200_2 = c2.rolling(200).mean()
+                            if len(ma200_2) > 0 and pd.notna(ma50_2.iloc[-1]) and pd.notna(ma200_2.iloc[-1]):
+                                h4_down2 = bool(float(ma50_2.iloc[-1]) < float(ma200_2.iloc[-1]))
+                        d1_down2 = False
+                        if subd1_dt2 is not None and not subd1_dt2.empty and "ema_fast" in subd1_dt2.columns and "ema_slow" in subd1_dt2.columns:
+                            ef2 = float(subd1_dt2["ema_fast"].iloc[-1]) if pd.notna(subd1_dt2["ema_fast"].iloc[-1]) else 0.0
+                            es2 = float(subd1_dt2["ema_slow"].iloc[-1]) if pd.notna(subd1_dt2["ema_slow"].iloc[-1]) else 0.0
+                            if ef2 > 0 and es2 > 0:
+                                d1_down2 = bool(ef2 < es2)
+                        dm2 = str(downtrend_mode or "or").lower()
+                        downtrend_now = (h4_down2 or d1_down2) if dm2 == "or" else (h4_down2 if dm2 == "h4" else (d1_down2 if dm2 == "d1" else False))
+                        if downtrend_now:
+                            min_lvl = float(downtrend_early_fail_min_r)
+                            levels = [lvl for lvl in levels if float(lvl) >= min_lvl]
+                            ratios = ratios[-len(levels):] if len(ratios) >= len(levels) else ratios
+
                         n = min(len(levels), len(ratios))
                         for lvl, ratio in list(zip(levels, ratios))[:n]:
                             lvl = abs(float(lvl))
@@ -572,18 +605,40 @@ def simulate(
                             lift = entry + (risk_unit * float(be_strong_stop_r))
                             stop = max(stop, float(lift))
 
-                # For the remainder: check stop/TP2/end
+                # For the remainder: check structure stop / stop / TP2 / end
                 exit_price: Optional[float] = None
                 result = ""
-                if low <= stop:
-                    exit_price = stop
-                    result = "loss" if stop < entry else "win"
-                elif high >= tp2 and tp2 > 0:
-                    exit_price = tp2
-                    result = "win"
-                elif i == len(df) - 1:
-                    exit_price = float(row["close"])
-                    result = "win" if exit_price > entry else "loss"
+
+                # Structure stop in downtrend: swing-low break + confirm bars
+                if swing_stop_enabled:
+                    # reuse downtrend_now from above if available, else compute quickly
+                    try:
+                        downtrend_now
+                    except NameError:
+                        downtrend_now = False
+
+                    if downtrend_now:
+                        lb = int(max(5, swing_stop_lookback))
+                        win = df.iloc[max(0, i - lb + 1): i + 1]
+                        swing_low = float(win["low"].min()) if not win.empty else float(row["low"])
+                        if float(row["close"]) < swing_low:
+                            swing_break_count += 1
+                        else:
+                            swing_break_count = 0
+                        if swing_break_count >= int(max(1, swing_stop_confirm_bars)):
+                            exit_price = float(row["close"])
+                            result = "loss" if exit_price < entry else "win"
+
+                if exit_price is None:
+                    if low <= stop:
+                        exit_price = stop
+                        result = "loss" if stop < entry else "win"
+                    elif high >= tp2 and tp2 > 0:
+                        exit_price = tp2
+                        result = "win"
+                    elif i == len(df) - 1:
+                        exit_price = float(row["close"])
+                        result = "win" if exit_price > entry else "loss"
 
                 if exit_price is not None:
                     gross_r = (exit_price - entry) / risk_unit
@@ -748,6 +803,10 @@ def main():
     ap.add_argument("--risk-per-trade", type=float, default=0.015)
     ap.add_argument("--mdd-limit-pct", type=float, default=0.30)
     ap.add_argument("--downtrend-mode", type=str, default="or", help="h4|d1|or|off")
+    ap.add_argument("--downtrend-early-fail-min-r", type=float, default=1.2)
+    ap.add_argument("--swing-stop", action="store_true", help="Enable swing-low structure stop in downtrend")
+    ap.add_argument("--swing-stop-lookback", type=int, default=20)
+    ap.add_argument("--swing-stop-confirm-bars", type=int, default=2)
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -804,6 +863,10 @@ def main():
         risk_per_trade=float(args.risk_per_trade),
         mdd_limit_pct=float(args.mdd_limit_pct),
         downtrend_mode=str(args.downtrend_mode),
+        downtrend_early_fail_min_r=float(args.downtrend_early_fail_min_r),
+        swing_stop_enabled=bool(args.swing_stop),
+        swing_stop_lookback=int(args.swing_stop_lookback),
+        swing_stop_confirm_bars=int(args.swing_stop_confirm_bars),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
