@@ -354,6 +354,10 @@ def run():
     fib_min = get_env_float("FIB_MIN", 0.382)
     fib_max = get_env_float("FIB_MAX", 0.618)
 
+    # volatility spike block (Phase B-lite)
+    vol_spike_block_enabled = env_bool("VOL_SPIKE_BLOCK_ENABLED", False)
+    vol_spike_block_atr_mult = get_env_float("VOL_SPIKE_BLOCK_ATR_MULT", 2.0)
+
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
     spread_bps_max = get_env_float("SPREAD_BPS_MAX", 12)
@@ -838,6 +842,12 @@ def run():
             if should_buy and (atr_pct < atr_regime_min_pct or atr_pct > atr_regime_max_pct):
                 should_buy = False
                 buy_reasons.append(f"atr_regime_block({atr_pct:.2f}%)")
+
+            # Volatility spike block (avoid entries during shock candles)
+            if should_buy and vol_spike_block_enabled and atr_now > 0 and vol_spike_block_atr_mult > 0:
+                if last_body >= (atr_now * vol_spike_block_atr_mult):
+                    should_buy = False
+                    buy_reasons.append(f"vol_spike_block(body>=ATR*{vol_spike_block_atr_mult:.2f})")
 
             # 스프레드 필터 + 진입 후 봉 쿨다운
             spread_bps = get_spread_bps(market)
