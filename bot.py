@@ -978,13 +978,17 @@ def run():
                 if not minute_consensus:
                     should_buy = False
                     buy_reasons.append("minute_mtf_no_consensus")
-                elif hour_mtf_score is not None and (score_based_buy_krw is None or score_based_buy_krw <= 0):
-                    should_buy = False
-                    buy_reasons.append(f"hour_mtf_score_low({hour_mtf_score})")
                 else:
                     buy_reasons.append(f"minute_mtf_consensus({sum(1 for x in minute_flags if x)}/{len(minute_flags)})")
                     if hour_mtf_score is not None:
                         buy_reasons.append(f"hour_mtf_score({hour_mtf_score})")
+
+                    # Relaxation mode (for log accumulation):
+                    # If minute consensus passes but hour score is below scout threshold, still allow SCOUT (min order).
+                    if hour_mtf_score is not None and (score_based_buy_krw is None or score_based_buy_krw <= 0):
+                        mtf_stage = "scout"
+                        score_based_buy_krw = max(min_buy_krw, float(equity) * float(mtf_stage_pcts.get("scout", 0.01)))
+                        buy_reasons.append(f"hour_mtf_score_low_allow_scout({hour_mtf_score})")
                     if mtf_stage is not None:
                         buy_reasons.append(f"mtf_stage({mtf_stage})")
 
