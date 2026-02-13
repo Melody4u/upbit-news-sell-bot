@@ -2,6 +2,12 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Runtime logs / state (never commit)
 logs/*.jsonl
+logs/*.log
+logs/*.out.log
+logs/*.err.log
 logs/runtime_state.json
 logs/market_risk.json
+logs/stop_alert_state.json
