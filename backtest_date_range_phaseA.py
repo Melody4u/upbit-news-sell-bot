@@ -11,6 +11,9 @@ Notes:
 - Interval for decision loop: 60m candles.
 - MTF score intervals: 30m/60m/240m/day/week (Phase A default).
 - Minute consensus (3m/5m/15m) is NOT used here (too noisy + heavy API for long ranges).
+- "Wall St v1" mode in this script uses:
+  - D1 regime filter (MA50>MA200 and MA200 slope > 0)
+  - Fib pullback zone (0.382~0.618 of recent swing) + EMA20 rebound confirmation
 """
 
 import argparse
@@ -80,6 +83,22 @@ def mtf_ok(df: pd.DataFrame) -> bool:
     return bool(float(ma50.iloc[-1]) > float(ma200.iloc[-1]) and float(close.iloc[-1]) > float(ma50.iloc[-1]))
 
 
+def d1_regime_ok(dfd: pd.DataFrame, ts: pd.Timestamp, slope_lookback: int = 5) -> bool:
+    """D1 regime filter: MA50>MA200 and MA200 slope>0 at timestamp ts."""
+    if dfd is None or dfd.empty or not isinstance(dfd.index, pd.DatetimeIndex):
+        return False
+    sub = dfd[dfd.index <= ts]
+    if len(sub) < (200 + slope_lookback + 5):
+        return False
+    close = sub["close"]
+    ma50 = close.rolling(50).mean()
+    ma200 = close.rolling(200).mean()
+    if pd.isna(ma50.iloc[-1]) or pd.isna(ma200.iloc[-1]):
+        return False
+    slope = float(ma200.iloc[-1] - ma200.iloc[-1 - slope_lookback])
+    return bool(float(ma50.iloc[-1]) > float(ma200.iloc[-1]) and slope > 0)
+
+
 def score_mtf(row_ts: pd.Timestamp, df_by_itv: Dict[str, pd.DataFrame], weights: Dict[str, int]) -> int:
     score = 0
     for itv, w in weights.items():
@@ -104,6 +123,11 @@ def simulate(
     min_rr: float = 3.0,
     cost_bps: float = 10.0,
     weights: Optional[Dict[str, int]] = None,
+    wallst_v1: bool = True,
+    fib_lookback: int = 120,
+    fib_min: float = 0.382,
+    fib_max: float = 0.618,
+    d1_slope_lookback: int = 5,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -123,6 +147,7 @@ def simulate(
     # Indicators on 60m
     df = df60.copy()
     df["atr"] = compute_atr(df, 14)
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
 
     in_pos = False
     entry = stop = tp = 0.0
@@ -142,9 +167,34 @@ def simulate(
             if s < 30:
                 continue
 
-            # Simple breakout trigger to approximate entry (close>prev high)
-            if float(row["close"]) <= float(prev["high"]):
-                continue
+            if wallst_v1:
+                # 1) D1 regime filter
+                if not d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback):
+                    continue
+
+                # 2) Fib pullback zone of recent swing (on decision TF window)
+                lb = int(max(50, fib_lookback))
+                win = df.iloc[max(0, i - lb + 1): i + 1]
+                if win.empty:
+                    continue
+                swing_high = float(win["high"].max())
+                swing_low = float(win["low"].min())
+                rng = max(1e-9, swing_high - swing_low)
+                zone_high = swing_high - (rng * float(fib_min))
+                zone_low = swing_high - (rng * float(fib_max))
+                in_zone = (float(row["close"]) >= zone_low) and (float(row["close"]) <= zone_high)
+                if not in_zone:
+                    continue
+
+                # 3) Rebound confirmation: close crosses above EMA20
+                ema_now = float(row["ema20"]) if pd.notna(row["ema20"]) else 0.0
+                ema_prev = float(prev["ema20"]) if pd.notna(prev["ema20"]) else 0.0
+                if not (ema_now > 0 and ema_prev > 0 and float(row["close"]) > ema_now and float(prev["close"]) <= ema_prev):
+                    continue
+            else:
+                # Simple breakout trigger to approximate entry (close>prev high)
+                if float(row["close"]) <= float(prev["high"]):
+                    continue
 
             entry = float(row["close"])
             stop = entry - atr
@@ -189,6 +239,7 @@ def simulate(
         "market": market,
         "start": str(start.date()),
         "end": str((end - pd.Timedelta(days=0)).date()),
+        "wallst_v1": bool(wallst_v1),
         "trades": total,
         "wins": wins,
         "losses": losses,
@@ -199,6 +250,8 @@ def simulate(
         "min_rr": min_rr,
         "decision_tf": "minute60",
         "mtf_weights": weights,
+        "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max},
+        "d1_slope_lookback": d1_slope_lookback,
     }
 
 
@@ -209,12 +262,28 @@ def main():
     ap.add_argument("--end", required=True, help="YYYY-MM-DD (exclusive end)")
     ap.add_argument("--min-rr", type=float, default=3.0)
     ap.add_argument("--cost-bps", type=float, default=10.0)
+    ap.add_argument("--wallst-v1", action="store_true", help="Enable Wall St v1 entry: D1 regime + fib pullback + EMA20 rebound")
+    ap.add_argument("--fib-lookback", type=int, default=120)
+    ap.add_argument("--fib-min", type=float, default=0.382)
+    ap.add_argument("--fib-max", type=float, default=0.618)
+    ap.add_argument("--d1-slope-lookback", type=int, default=5)
     args = ap.parse_args()
 
     start = pd.Timestamp(datetime.fromisoformat(args.start))
     end = pd.Timestamp(datetime.fromisoformat(args.end))
 
-    res = simulate(args.market, start, end, min_rr=args.min_rr, cost_bps=args.cost_bps)
+    res = simulate(
+        args.market,
+        start,
+        end,
+        min_rr=args.min_rr,
+        cost_bps=args.cost_bps,
+        wallst_v1=bool(args.wallst_v1),
+        fib_lookback=int(args.fib_lookback),
+        fib_min=float(args.fib_min),
+        fib_max=float(args.fib_max),
+        d1_slope_lookback=int(args.d1_slope_lookback),
+    )
     print(res)
 
 
