@@ -19,7 +19,7 @@ Notes:
 import argparse
 import time
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,30 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    atr = compute_atr(df, period).replace(0, np.nan)
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr)
+
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx.fillna(0)
+
+
+def parse_csv_floats(s: str, default: List[float]) -> List[float]:
+    try:
+        vals = [float(x.strip()) for x in (s or "").split(",") if x.strip()]
+        return vals if vals else default
+    except Exception:
+        return default
 
 
 def mtf_ok(df: pd.DataFrame) -> bool:
@@ -133,6 +157,12 @@ def simulate(
     tp2_r: float = 1.6,
     tp1_ratio: float = 0.6,
     be_offset_bps: float = 8.0,
+    early_fail_enabled: bool = True,
+    early_fail_mode: str = "weak",  # off|weak|always|hybrid
+    early_fail_levels_r: str = "0.6,0.9,1.2,1.6,2.0",
+    early_fail_cut_ratios: str = "0.1,0.3,0.5,0.7,1.0",
+    early_fail_strong_levels_r: str = "1.6,2.0",
+    early_fail_strong_cut_ratios: str = "0.5,1.0",
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -153,6 +183,7 @@ def simulate(
     df = df60.copy()
     df["atr"] = compute_atr(df, 14)
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["adx"] = compute_adx(df, 14)
 
     in_pos = False
     entry = stop = 0.0
@@ -160,6 +191,7 @@ def simulate(
     tp = 0.0
     tp1 = tp2 = 0.0
     partial_done = False
+    early_cut_done = False
     trades = []
 
     for i in range(220, len(df)):
@@ -219,6 +251,7 @@ def simulate(
             if entry <= stop:
                 continue
             partial_done = False
+            early_cut_done = False
             in_pos = True
         else:
             low = float(row["low"])
@@ -229,6 +262,38 @@ def simulate(
 
             if highwr_v1:
                 # Multi-leg exit
+                # Early fail cut: ladder in R, mode controls aggressiveness
+                if early_fail_enabled and (not early_cut_done):
+                    mode = str(early_fail_mode or "weak").lower()
+                    adx_now = float(row.get("adx", 0.0) or 0.0)
+                    ema_now = float(row.get("ema20", 0.0) or 0.0)
+                    weak_ctx = (adx_now < 20.0) or (ema_now > 0 and float(row["close"]) < ema_now)
+
+                    if mode in ("off", "false", "0"):
+                        pass
+                    else:
+                        levels = parse_csv_floats(str(early_fail_levels_r), [0.6, 0.9, 1.2, 1.6, 2.0])
+                        ratios = parse_csv_floats(str(early_fail_cut_ratios), [0.1, 0.3, 0.5, 0.7, 1.0])
+                        slevels = parse_csv_floats(str(early_fail_strong_levels_r), [1.6, 2.0])
+                        sratios = parse_csv_floats(str(early_fail_strong_cut_ratios), [0.5, 1.0])
+
+                        if mode == "hybrid" and (not weak_ctx):
+                            levels, ratios = slevels, sratios
+
+                        n = min(len(levels), len(ratios))
+                        for lvl, ratio in list(zip(levels, ratios))[:n]:
+                            lvl = abs(float(lvl))
+                            if lvl <= 0:
+                                continue
+                            cut_price = entry - (risk_unit * lvl)
+                            if low <= cut_price:
+                                gross_r_cut = (cut_price - entry) / risk_unit
+                                cost_leg = (cost_bps / 10000.0) * 2.0
+                                net_r_cut = gross_r_cut - (cost_leg / max(1e-9, risk_unit / entry))
+                                trades.append({"result": "loss", "r": float(net_r_cut) * float(ratio), "leg": f"early_cut_{lvl:.2f}R"})
+                                early_cut_done = True
+                                break
+
                 # If TP1 hit: realize partial, then move stop to BE (+bps)
                 if (not partial_done) and high >= tp1 and tp1 > 0:
                     # partial exit at tp1
@@ -312,6 +377,14 @@ def simulate(
         "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max},
         "d1_slope_lookback": d1_slope_lookback,
         "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps},
+        "early_fail": {
+            "enabled": early_fail_enabled,
+            "mode": early_fail_mode,
+            "levels": early_fail_levels_r,
+            "ratios": early_fail_cut_ratios,
+            "strong_levels": early_fail_strong_levels_r,
+            "strong_ratios": early_fail_strong_cut_ratios,
+        },
     }
 
 
@@ -332,6 +405,12 @@ def main():
     ap.add_argument("--tp2-r", type=float, default=1.6)
     ap.add_argument("--tp1-ratio", type=float, default=0.6)
     ap.add_argument("--be-offset-bps", type=float, default=8.0)
+    ap.add_argument("--early-fail", action="store_true", help="Enable early fail cut")
+    ap.add_argument("--early-fail-mode", type=str, default="hybrid", help="weak|always|hybrid")
+    ap.add_argument("--early-fail-levels", type=str, default="0.6,0.9,1.2,1.6,2.0")
+    ap.add_argument("--early-fail-ratios", type=str, default="0.1,0.3,0.5,0.7,1.0")
+    ap.add_argument("--early-fail-strong-levels", type=str, default="1.6,2.0")
+    ap.add_argument("--early-fail-strong-ratios", type=str, default="0.5,1.0")
     args = ap.parse_args()
 
     start = pd.Timestamp(datetime.fromisoformat(args.start))
@@ -353,6 +432,12 @@ def main():
         tp2_r=float(args.tp2_r),
         tp1_ratio=float(args.tp1_ratio),
         be_offset_bps=float(args.be_offset_bps),
+        early_fail_enabled=bool(args.early_fail),
+        early_fail_mode=str(args.early_fail_mode),
+        early_fail_levels_r=str(args.early_fail_levels),
+        early_fail_cut_ratios=str(args.early_fail_ratios),
+        early_fail_strong_levels_r=str(args.early_fail_strong_levels),
+        early_fail_strong_cut_ratios=str(args.early_fail_strong_ratios),
     )
     print(res)
 
