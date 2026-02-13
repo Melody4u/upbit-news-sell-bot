@@ -387,6 +387,7 @@ def run():
     early_fail_levels_r = parse_float_list_csv(os.getenv("EARLY_FAIL_LEVELS_R", "0.6,0.9,1.2,1.6,2.0"), [0.6, 0.9, 1.2, 1.6, 2.0])
     early_fail_cut_ratios = parse_float_list_csv(os.getenv("EARLY_FAIL_CUT_RATIOS", "0.1,0.3,0.5,0.7,1.0"), [0.1, 0.3, 0.5, 0.7, 1.0])
     early_fail_max_cut_ratio = get_env_float("EARLY_FAIL_MAX_CUT_RATIO", 1.0)
+    early_fail_mode = os.getenv("EARLY_FAIL_MODE", "weak_trend_only").lower()  # weak_trend_only|always
     if len(partial_tp_levels) != len(partial_tp_ratios):
         logging.warning("PARTIAL_TP length mismatch | levels=%s ratios=%s -> truncating to min length", len(partial_tp_levels), len(partial_tp_ratios))
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
@@ -491,6 +492,12 @@ def run():
         except Exception:
             last_buy_stop_price = None
     last_buy_ts = float(runtime_state.get("last_buy_ts", 0.0) or 0.0)
+    entry_stop_price = runtime_state.get("entry_stop_price")
+    if entry_stop_price is not None:
+        try:
+            entry_stop_price = float(entry_stop_price)
+        except Exception:
+            entry_stop_price = None
     partial_tp_done = set(str(x) for x in (runtime_state.get("partial_tp_done") or []))
     early_fail_done = set(str(x) for x in (runtime_state.get("early_fail_done") or []))
     trailing_peak_price = float(runtime_state.get("trailing_peak_price", 0.0) or 0.0)
@@ -673,9 +680,11 @@ def run():
 
             if coin_balance <= 0:
                 last_buy_stop_price = None
+                entry_stop_price = None
                 last_buy_ts = 0.0
                 trailing_peak_price = 0.0
                 partial_tp_done = set()
+                early_fail_done = set()
                 active_box_high = None
                 addon_done = False
 
@@ -1061,11 +1070,15 @@ def run():
             # 분할 익절(1R,2R 등) + Early fail cut(손실 구간 부분 정리)
             partial_tp_executed = False
             if coin_balance > 0 and avg_buy_price > 0 and last_buy_stop_price is not None and last_buy_stop_price < avg_buy_price:
-                risk_unit = avg_buy_price - last_buy_stop_price
+                # R basis should be stable: use entry_stop_price (captured at entry) if available.
+                stop_basis = entry_stop_price if (entry_stop_price is not None and entry_stop_price < avg_buy_price) else last_buy_stop_price
+                risk_unit = avg_buy_price - float(stop_basis)
                 r_now = (current_price - avg_buy_price) / max(risk_unit, 1e-9)
 
                 # Early fail cut ladder (negative R): cut portions as loss deepens
-                if early_fail_cut_enabled and r_now < 0 and early_fail_levels_r and early_fail_cut_ratios:
+                weak_trend_ctx = (metrics.get("adx", 0) < float(cfg["ADX_MIN"])) or (last_close < float(metrics.get("ma20", 0) or 0))
+                early_fail_ctx_ok = (early_fail_mode == "always") or weak_trend_ctx or (not mtf_trend_ok) or downtrend_block
+                if early_fail_cut_enabled and early_fail_ctx_ok and r_now < 0 and early_fail_levels_r and early_fail_cut_ratios:
                     n = min(len(early_fail_levels_r), len(early_fail_cut_ratios))
                     cut_levels = early_fail_levels_r[:n]
                     cut_ratios = early_fail_cut_ratios[:n]
@@ -1173,6 +1186,7 @@ def run():
                                     be_price = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
                                     if last_buy_stop_price is None or be_price > float(last_buy_stop_price):
                                         last_buy_stop_price = float(be_price)
+                                        # keep entry_stop_price unchanged; we want stable R basis
                                         signal_reasons.append(f"be_stop_after_tp1({be_offset_bps:.1f}bps)")
                                 partial_tp_executed = True
                         break
@@ -1300,6 +1314,8 @@ def run():
                             structural_stop = last_low
                             atr_stop = (last_close - (atr_now * entry_stop_atr_mult)) if (entry_stop_atr_mult > 0 and atr_now > 0) else structural_stop
                             last_buy_stop_price = min(structural_stop, atr_stop)
+                            entry_stop_price = float(last_buy_stop_price)
+                            early_fail_done = set()
                     else:
                         before_coin, before_krw = coin_balance, krw_balance
                         notify_event(alert_webhook_url, alert_events, "order_sent", f"buy sent {market} krw={buy_krw:.0f}")
@@ -1324,6 +1340,8 @@ def run():
                                 structural_stop = last_low
                                 atr_stop = (last_close - (atr_now * entry_stop_atr_mult)) if (entry_stop_atr_mult > 0 and atr_now > 0) else structural_stop
                                 last_buy_stop_price = min(structural_stop, atr_stop)
+                                entry_stop_price = float(last_buy_stop_price)
+                                early_fail_done = set()
                             pending_order = None
                         elif order_uuid is None:
                             notify_event(alert_webhook_url, alert_events, "rejected", f"buy rejected {market}")
@@ -1369,8 +1387,10 @@ def run():
             runtime_state["last_signal_hash"] = last_signal_hash
             runtime_state["pending_order"] = pending_order
             runtime_state["last_buy_stop_price"] = last_buy_stop_price
+            runtime_state["entry_stop_price"] = entry_stop_price
             runtime_state["last_buy_ts"] = float(last_buy_ts)
             runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+            runtime_state["early_fail_done"] = sorted(list(early_fail_done))
             runtime_state["trailing_peak_price"] = float(trailing_peak_price)
             save_runtime_state(runtime_state_path, runtime_state)
             loop_error_count = 0
