@@ -152,11 +152,15 @@ def simulate(
     fib_lookback: int = 120,
     fib_min: float = 0.382,
     fib_max: float = 0.618,
+    fib_swing_confirm: bool = True,
     d1_slope_lookback: int = 5,
     tp1_r: float = 0.8,
     tp2_r: float = 1.6,
     tp1_ratio: float = 0.6,
     be_offset_bps: float = 8.0,
+    be_move_mode: str = "hybrid",  # always|weak_only|hybrid
+    be_strong_stop_r: float = -0.2,
+    adx_min: float = 20.0,
     early_fail_enabled: bool = True,
     early_fail_mode: str = "weak",  # off|weak|always|hybrid
     early_fail_levels_r: str = "0.6,0.9,1.2,1.6,2.0",
@@ -218,6 +222,12 @@ def simulate(
                 win = df.iloc[max(0, i - lb + 1): i + 1]
                 if win.empty:
                     continue
+                if fib_swing_confirm:
+                    hi_i = int(win["high"].values.argmax())
+                    lo_i = int(win["low"].values.argmin())
+                    if not (lo_i < hi_i):
+                        continue
+
                 swing_high = float(win["high"].max())
                 swing_low = float(win["low"].min())
                 rng = max(1e-9, swing_high - swing_low)
@@ -303,9 +313,28 @@ def simulate(
                     net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
                     trades.append({"result": "win", "r": float(net_r1) * float(tp1_ratio), "leg": "tp1"})
                     partial_done = True
-                    # move stop to breakeven + buffer
-                    be_price = entry * (1.0 + (be_offset_bps / 10000.0))
-                    stop = max(stop, float(be_price))
+                    # move stop (context-aware): protect in weak trend, preserve right-tail in strong trend
+                    mode_be = str(be_move_mode or "hybrid").lower()
+                    adx_now2 = float(row.get("adx", 0.0) or 0.0)
+                    ema_now2 = float(row.get("ema20", 0.0) or 0.0)
+                    strong_ctx2 = (adx_now2 >= float(adx_min)) and (ema_now2 > 0 and float(row["close"]) >= ema_now2)
+                    weak_ctx2 = (adx_now2 < float(adx_min)) or (ema_now2 > 0 and float(row["close"]) < ema_now2)
+
+                    if mode_be == "always":
+                        be_price = entry * (1.0 + (be_offset_bps / 10000.0))
+                        stop = max(stop, float(be_price))
+                    elif mode_be == "weak_only":
+                        if weak_ctx2:
+                            be_price = entry * (1.0 + (be_offset_bps / 10000.0))
+                            stop = max(stop, float(be_price))
+                    else:  # hybrid
+                        if weak_ctx2 and (not strong_ctx2):
+                            be_price = entry * (1.0 + (be_offset_bps / 10000.0))
+                            stop = max(stop, float(be_price))
+                        elif strong_ctx2:
+                            # lift stop closer but leave room: entry + be_strong_stop_r * risk_unit
+                            lift = entry + (risk_unit * float(be_strong_stop_r))
+                            stop = max(stop, float(lift))
 
                 # For the remainder: check stop/TP2/end
                 exit_price: Optional[float] = None
@@ -374,9 +403,9 @@ def simulate(
         "min_rr": min_rr,
         "decision_tf": "minute60",
         "mtf_weights": weights,
-        "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max},
+        "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max, "swing_confirm": fib_swing_confirm},
         "d1_slope_lookback": d1_slope_lookback,
-        "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps},
+        "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps, "be_move_mode": be_move_mode, "be_strong_stop_r": be_strong_stop_r, "adx_min": adx_min},
         "early_fail": {
             "enabled": early_fail_enabled,
             "mode": early_fail_mode,
@@ -400,11 +429,16 @@ def main():
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
+    ap.add_argument("--fib-swing-confirm", action="store_true", help="Require swing confirmation (low before high) in fib window")
+    ap.add_argument("--no-fib-swing-confirm", action="store_true", help="Disable fib swing confirmation")
     ap.add_argument("--d1-slope-lookback", type=int, default=5)
     ap.add_argument("--tp1-r", type=float, default=0.8)
     ap.add_argument("--tp2-r", type=float, default=1.6)
     ap.add_argument("--tp1-ratio", type=float, default=0.6)
     ap.add_argument("--be-offset-bps", type=float, default=8.0)
+    ap.add_argument("--be-move-mode", type=str, default="hybrid", help="always|weak_only|hybrid")
+    ap.add_argument("--be-strong-stop-r", type=float, default=-0.2)
+    ap.add_argument("--adx-min", type=float, default=20.0)
     ap.add_argument("--early-fail", action="store_true", help="Enable early fail cut")
     ap.add_argument("--early-fail-mode", type=str, default="hybrid", help="weak|always|hybrid")
     ap.add_argument("--early-fail-levels", type=str, default="0.6,0.9,1.2,1.6,2.0")
@@ -427,11 +461,15 @@ def main():
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
+        fib_swing_confirm=(False if bool(args.no_fib_swing_confirm) else (True if bool(args.fib_swing_confirm) else True)),
         d1_slope_lookback=int(args.d1_slope_lookback),
         tp1_r=float(args.tp1_r),
         tp2_r=float(args.tp2_r),
         tp1_ratio=float(args.tp1_ratio),
         be_offset_bps=float(args.be_offset_bps),
+        be_move_mode=str(args.be_move_mode),
+        be_strong_stop_r=float(args.be_strong_stop_r),
+        adx_min=float(args.adx_min),
         early_fail_enabled=bool(args.early_fail),
         early_fail_mode=str(args.early_fail_mode),
         early_fail_levels_r=str(args.early_fail_levels),
