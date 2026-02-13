@@ -124,10 +124,15 @@ def simulate(
     cost_bps: float = 10.0,
     weights: Optional[Dict[str, int]] = None,
     wallst_v1: bool = True,
+    highwr_v1: bool = True,
     fib_lookback: int = 120,
     fib_min: float = 0.382,
     fib_max: float = 0.618,
     d1_slope_lookback: int = 5,
+    tp1_r: float = 0.8,
+    tp2_r: float = 1.6,
+    tp1_ratio: float = 0.6,
+    be_offset_bps: float = 8.0,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -150,7 +155,11 @@ def simulate(
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
 
     in_pos = False
-    entry = stop = tp = 0.0
+    entry = stop = 0.0
+    risk0 = 0.0
+    tp = 0.0
+    tp1 = tp2 = 0.0
+    partial_done = False
     trades = []
 
     for i in range(220, len(df)):
@@ -198,32 +207,81 @@ def simulate(
 
             entry = float(row["close"])
             stop = entry - atr
-            tp = entry + atr * float(min_rr)
+            risk0 = max(1e-9, entry - stop)
+            if highwr_v1:
+                # high win-rate exit plan: TP1 partial + BE move + TP2
+                tp1 = entry + (atr * float(tp1_r))
+                tp2 = entry + (atr * float(tp2_r))
+                tp = tp2
+            else:
+                tp = entry + atr * float(min_rr)
+                tp1 = tp2 = 0.0
             if entry <= stop:
                 continue
+            partial_done = False
             in_pos = True
         else:
             low = float(row["low"])
             high = float(row["high"])
-            exit_price: Optional[float] = None
-            result = ""
-            if low <= stop:
-                exit_price = stop
-                result = "loss"
-            elif high >= tp:
-                exit_price = tp
-                result = "win"
-            elif i == len(df) - 1:
-                exit_price = float(row["close"])
-                result = "win" if exit_price > entry else "loss"
 
-            if exit_price is not None:
-                # apply simple round-trip cost
-                cost = (cost_bps / 10000.0) * 2.0
-                gross_r = (exit_price - entry) / max(1e-9, (entry - stop))
-                net_r = gross_r - (cost / max(1e-9, (entry - stop) / entry))
-                trades.append({"result": result, "r": float(net_r)})
-                in_pos = False
+            # Use initial risk (from entry to initial stop) for R calculations.
+            risk_unit = max(1e-9, float(risk0))
+
+            if highwr_v1:
+                # Multi-leg exit
+                # If TP1 hit: realize partial, then move stop to BE (+bps)
+                if (not partial_done) and high >= tp1 and tp1 > 0:
+                    # partial exit at tp1
+                    gross_r1 = (tp1 - entry) / risk_unit
+                    # cost for this leg (entry+partial exit). assume round trip on that fraction
+                    cost_leg = (cost_bps / 10000.0) * 2.0
+                    net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
+                    trades.append({"result": "win", "r": float(net_r1) * float(tp1_ratio), "leg": "tp1"})
+                    partial_done = True
+                    # move stop to breakeven + buffer
+                    be_price = entry * (1.0 + (be_offset_bps / 10000.0))
+                    stop = max(stop, float(be_price))
+
+                # For the remainder: check stop/TP2/end
+                exit_price: Optional[float] = None
+                result = ""
+                if low <= stop:
+                    exit_price = stop
+                    result = "loss" if stop < entry else "win"
+                elif high >= tp2 and tp2 > 0:
+                    exit_price = tp2
+                    result = "win"
+                elif i == len(df) - 1:
+                    exit_price = float(row["close"])
+                    result = "win" if exit_price > entry else "loss"
+
+                if exit_price is not None:
+                    gross_r = (exit_price - entry) / risk_unit
+                    cost_leg = (cost_bps / 10000.0) * 2.0
+                    net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
+                    remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
+                    trades.append({"result": result, "r": float(net_r) * float(remain_ratio), "leg": "rem"})
+                    in_pos = False
+
+            else:
+                exit_price: Optional[float] = None
+                result = ""
+                if low <= stop:
+                    exit_price = stop
+                    result = "loss"
+                elif high >= tp:
+                    exit_price = tp
+                    result = "win"
+                elif i == len(df) - 1:
+                    exit_price = float(row["close"])
+                    result = "win" if exit_price > entry else "loss"
+
+                if exit_price is not None:
+                    cost = (cost_bps / 10000.0) * 2.0
+                    gross_r = (exit_price - entry) / risk_unit
+                    net_r = gross_r - (cost / max(1e-9, risk_unit / entry))
+                    trades.append({"result": result, "r": float(net_r)})
+                    in_pos = False
 
     total = len(trades)
     wins = sum(1 for t in trades if t["result"] == "win")
@@ -240,6 +298,7 @@ def simulate(
         "start": str(start.date()),
         "end": str((end - pd.Timedelta(days=0)).date()),
         "wallst_v1": bool(wallst_v1),
+        "highwr_v1": bool(highwr_v1),
         "trades": total,
         "wins": wins,
         "losses": losses,
@@ -252,6 +311,7 @@ def simulate(
         "mtf_weights": weights,
         "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max},
         "d1_slope_lookback": d1_slope_lookback,
+        "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps},
     }
 
 
@@ -263,10 +323,15 @@ def main():
     ap.add_argument("--min-rr", type=float, default=3.0)
     ap.add_argument("--cost-bps", type=float, default=10.0)
     ap.add_argument("--wallst-v1", action="store_true", help="Enable Wall St v1 entry: D1 regime + fib pullback + EMA20 rebound")
+    ap.add_argument("--highwr-v1", action="store_true", help="Enable high win-rate v1 exits: TP1 partial + BE + TP2")
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
     ap.add_argument("--d1-slope-lookback", type=int, default=5)
+    ap.add_argument("--tp1-r", type=float, default=0.8)
+    ap.add_argument("--tp2-r", type=float, default=1.6)
+    ap.add_argument("--tp1-ratio", type=float, default=0.6)
+    ap.add_argument("--be-offset-bps", type=float, default=8.0)
     args = ap.parse_args()
 
     start = pd.Timestamp(datetime.fromisoformat(args.start))
@@ -279,10 +344,15 @@ def main():
         min_rr=args.min_rr,
         cost_bps=args.cost_bps,
         wallst_v1=bool(args.wallst_v1),
+        highwr_v1=bool(args.highwr_v1),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
         d1_slope_lookback=int(args.d1_slope_lookback),
+        tp1_r=float(args.tp1_r),
+        tp2_r=float(args.tp2_r),
+        tp1_ratio=float(args.tp1_ratio),
+        be_offset_bps=float(args.be_offset_bps),
     )
     print(res)
 
