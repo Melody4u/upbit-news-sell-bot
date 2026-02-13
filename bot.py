@@ -381,6 +381,12 @@ def run():
     partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.6,0.4"), [0.6, 0.4])
     move_stop_to_be_after_tp1 = env_bool("MOVE_STOP_TO_BE_AFTER_TP1", True)
     be_offset_bps = get_env_float("BE_OFFSET_BPS", 8.0)
+
+    # Early fail cut (high win-rate / cut losers faster)
+    early_fail_cut_enabled = env_bool("EARLY_FAIL_CUT_ENABLED", True)
+    early_fail_levels_r = parse_float_list_csv(os.getenv("EARLY_FAIL_LEVELS_R", "0.6,0.9,1.2,1.6,2.0"), [0.6, 0.9, 1.2, 1.6, 2.0])
+    early_fail_cut_ratios = parse_float_list_csv(os.getenv("EARLY_FAIL_CUT_RATIOS", "0.1,0.3,0.5,0.7,1.0"), [0.1, 0.3, 0.5, 0.7, 1.0])
+    early_fail_max_cut_ratio = get_env_float("EARLY_FAIL_MAX_CUT_RATIO", 1.0)
     if len(partial_tp_levels) != len(partial_tp_ratios):
         logging.warning("PARTIAL_TP length mismatch | levels=%s ratios=%s -> truncating to min length", len(partial_tp_levels), len(partial_tp_ratios))
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
@@ -486,6 +492,7 @@ def run():
             last_buy_stop_price = None
     last_buy_ts = float(runtime_state.get("last_buy_ts", 0.0) or 0.0)
     partial_tp_done = set(str(x) for x in (runtime_state.get("partial_tp_done") or []))
+    early_fail_done = set(str(x) for x in (runtime_state.get("early_fail_done") or []))
     trailing_peak_price = float(runtime_state.get("trailing_peak_price", 0.0) or 0.0)
     prev_halted = bool(runtime_state.get("halted", False))
 
@@ -1051,11 +1058,74 @@ def run():
                 news_state.negative_score,
             )
 
-            # 분할 익절(1R,2R 등)
+            # 분할 익절(1R,2R 등) + Early fail cut(손실 구간 부분 정리)
             partial_tp_executed = False
             if coin_balance > 0 and avg_buy_price > 0 and last_buy_stop_price is not None and last_buy_stop_price < avg_buy_price:
                 risk_unit = avg_buy_price - last_buy_stop_price
                 r_now = (current_price - avg_buy_price) / max(risk_unit, 1e-9)
+
+                # Early fail cut ladder (negative R): cut portions as loss deepens
+                if early_fail_cut_enabled and r_now < 0 and early_fail_levels_r and early_fail_cut_ratios:
+                    n = min(len(early_fail_levels_r), len(early_fail_cut_ratios))
+                    cut_levels = early_fail_levels_r[:n]
+                    cut_ratios = early_fail_cut_ratios[:n]
+                    # clamp
+                    max_cut = min(1.0, max(0.0, float(early_fail_max_cut_ratio)))
+                    for lvl, ratio in zip(cut_levels, cut_ratios):
+                        try:
+                            lvl_f = float(lvl)
+                            ratio_f = float(ratio)
+                        except Exception:
+                            continue
+                        if lvl_f <= 0:
+                            continue
+                        key = f"{lvl_f:.4f}"
+                        if key in early_fail_done:
+                            continue
+                        if r_now <= (-lvl_f) and ratio_f > 0:
+                            cut_ratio = min(max(0.0, ratio_f), 1.0)
+                            cut_ratio = min(cut_ratio, max_cut)
+                            cut_coin = coin_balance * cut_ratio
+                            cut_value = cut_coin * current_price
+                            if cut_value >= min_sell_krw:
+                                logging.warning("EARLY FAIL CUT | R=%.2f level=-%.2f ratio=%.2f", r_now, lvl_f, cut_ratio)
+                                append_trade_log(trade_log_path, {
+                                    "ts": int(time.time()),
+                                    "side": "sell_partial",
+                                    "market": market,
+                                    "price": current_price,
+                                    "score": signal_score,
+                                    "reasons": [f"early_fail_cut_{lvl_f:.2f}R"],
+                                    "dry_run": dry_run,
+                                })
+                                filled_cut = False
+                                if dry_run:
+                                    last_action_ts = now_ts
+                                    last_signal_hash = make_signal_hash("sell_partial", [f"early_fail_cut_{lvl_f:.2f}R"], int(signal_score), market)
+                                    filled_cut = True
+                                else:
+                                    before_coin, before_krw = coin_balance, krw_balance
+                                    notify_event(alert_webhook_url, alert_events, "order_sent", f"early_fail_cut sent {market} ratio={cut_ratio:.2f}")
+                                    result = place_order_with_retry("early_fail_cut_market_order", upbit.sell_market_order, market, cut_coin)
+                                    logging.warning("early_fail_cut result: %s", result)
+                                    order_uuid = result.get("uuid") if isinstance(result, dict) else None
+                                    if order_uuid:
+                                        pending_order = {"uuid": order_uuid, "side": "early_fail_cut", "created_ts": now_ts, "timeout_notified": False}
+                                    time.sleep(1.0)
+                                    after_coin, _, _ = get_account_state(upbit, market)
+                                    after_krw = get_krw_balance(upbit)
+                                    filled_cut = verify_position_change(before_coin, before_krw, after_coin, after_krw, "sell")
+                                    logging.warning("early_fail_cut fill check | filled=%s before_coin=%.8f after_coin=%.8f", filled_cut, before_coin, after_coin)
+                                    if filled_cut:
+                                        pending_order = None
+                                        notify_event(alert_webhook_url, alert_events, "filled", f"early_fail_cut filled {market} level=-{lvl_f:.2f}R")
+                                if filled_cut:
+                                    early_fail_done.add(key)
+                                    runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                                    partial_tp_executed = True
+                            break
+
+                # Profit-side partial TP
                 for lvl, ratio in zip(partial_tp_levels, partial_tp_ratios):
                     key = f"{lvl:.4f}"
                     if key in partial_tp_done:
@@ -1114,6 +1184,7 @@ def run():
                 runtime_state["last_buy_stop_price"] = last_buy_stop_price
                 runtime_state["last_buy_ts"] = float(last_buy_ts)
                 runtime_state["partial_tp_done"] = sorted(list(partial_tp_done))
+                runtime_state["early_fail_done"] = sorted(list(early_fail_done))
                 runtime_state["trailing_peak_price"] = float(trailing_peak_price)
                 runtime_state["last_block_hash"] = last_block_hash
                 runtime_state["last_block_ts"] = float(last_block_ts)
