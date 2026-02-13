@@ -153,6 +153,9 @@ def simulate(
     scout_min_score: int = 20,
     pos_min_frac: float = 0.15,
     pos_max_frac: float = 1.0,
+    good_gate_mode: str = "none",  # none|l1|l2
+    good_gate_l1_score: int = 65,
+    good_gate_l2_score: int = 80,
     fib_lookback: int = 120,
     fib_min: float = 0.382,
     fib_max: float = 0.618,
@@ -201,6 +204,8 @@ def simulate(
     partial_done = False
     early_cut_done = False
     pos_frac = 1.0
+    entry_ctx = ""
+    entry_ctx_counts = {"l1": 0, "l2": 0, "other": 0}
     trades = []
 
     for i in range(220, len(df)):
@@ -228,10 +233,29 @@ def simulate(
 
             if wallst_v1:
                 # 1) D1 regime filter (hard by default; soft mode will downsize instead)
-                if not d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback):
+                d1_ok = d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback)
+                if not d1_ok:
                     if not wallst_soft:
                         continue
                     pos_frac *= 0.4
+
+                # good-gate context (Level 1/2)
+                # L1 (보수): score>=65 + (proxy) 4h trend ok + d1_ok
+                # L2 (매우 강함): L1 + score>=80 + ADX>=min + close>=EMA20
+                sub240 = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+                h4_ok = mtf_ok(sub240.tail(260)) if (sub240 is not None and len(sub240) >= 220) else False
+                ema_now_ctx = float(row["ema20"]) if pd.notna(row["ema20"]) else 0.0
+                adx_now_ctx = float(row["adx"]) if pd.notna(row["adx"]) else 0.0
+
+                l1 = (int(s) >= int(good_gate_l1_score)) and bool(h4_ok) and bool(d1_ok)
+                l2 = l1 and (int(s) >= int(good_gate_l2_score)) and (adx_now_ctx >= float(adx_min)) and (ema_now_ctx > 0 and float(row["close"]) >= ema_now_ctx)
+
+                if str(good_gate_mode).lower() == "l2" and (not l2):
+                    continue
+                if str(good_gate_mode).lower() == "l1" and (not l1):
+                    continue
+
+                entry_ctx = "l2" if l2 else ("l1" if l1 else "other")
 
                 # 2) Fib pullback zone (soft by default to keep trade frequency)
                 lb = int(max(50, fib_lookback))
@@ -268,6 +292,7 @@ def simulate(
 
                 pos_frac = max(0.05, min(1.0, float(pos_frac)))
             else:
+                entry_ctx = "other"
                 # Simple breakout trigger to approximate entry (close>prev high)
                 if float(row["close"]) <= float(prev["high"]):
                     continue
@@ -289,6 +314,7 @@ def simulate(
             partial_done = False
             early_cut_done = False
             in_pos = True
+            entry_ctx_counts[entry_ctx] = int(entry_ctx_counts.get(entry_ctx, 0)) + 1
         else:
             low = float(row["low"])
             high = float(row["high"])
@@ -424,6 +450,7 @@ def simulate(
         "highwr_v1": bool(highwr_v1),
         "scout_min_score": int(scout_min_score),
         "pos_frac": {"min": float(pos_min_frac), "max": float(pos_max_frac)},
+        "good_gate": {"mode": str(good_gate_mode), "l1_score": int(good_gate_l1_score), "l2_score": int(good_gate_l2_score), "entry_ctx_counts": entry_ctx_counts},
         "trades": total,
         "trades_per_month": round(float(trades_per_month), 2),
         "wins": wins,
@@ -462,6 +489,9 @@ def main():
     ap.add_argument("--scout-min-score", type=int, default=20)
     ap.add_argument("--pos-min-frac", type=float, default=0.15)
     ap.add_argument("--pos-max-frac", type=float, default=1.0)
+    ap.add_argument("--good-gate-mode", type=str, default="none", help="none|l1|l2")
+    ap.add_argument("--good-gate-l1-score", type=int, default=65)
+    ap.add_argument("--good-gate-l2-score", type=int, default=80)
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -499,6 +529,9 @@ def main():
         scout_min_score=int(args.scout_min_score),
         pos_min_frac=float(args.pos_min_frac),
         pos_max_frac=float(args.pos_max_frac),
+        good_gate_mode=str(args.good_gate_mode),
+        good_gate_l1_score=int(args.good_gate_l1_score),
+        good_gate_l2_score=int(args.good_gate_l2_score),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
