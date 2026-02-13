@@ -200,7 +200,9 @@ def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, floa
         score += 1
         reasons.append("price_below_vwma100")
 
-    # ?〓낫???꾪꽣
+    # MTF gate (buy score impact)
+    buy_score_raw = int(buy_score)
+    buy_reasons_raw = list(buy_reasons)
     if mtf_trend_ok:
         buy_score += 1
         buy_reasons.append("mtf_trend_ok")
@@ -275,6 +277,8 @@ def evaluate_signals(df: pd.DataFrame, avg_buy_price: float, cfg: Dict[str, floa
         "rsi": float(rsi.iloc[-1]),
         "atr_stop": float(atr_stop),
         "donchian_low": float(donchian_low.iloc[-1]) if pd.notna(donchian_low.iloc[-1]) else 0.0,
+        "buy_score_raw": buy_score_raw,
+        "buy_reasons_raw": buy_reasons_raw,
         "buy_score": buy_score,
         "buy_reasons": buy_reasons,
     }
@@ -712,6 +716,8 @@ def run():
                 score_based_buy_krw = max(0.0, equity * pct)
 
             signal_score, signal_reasons, metrics = evaluate_signals(df, avg_buy_price, cfg, mtf_trend_ok=mtf_trend_ok)
+            buy_score_raw = int(metrics.get("buy_score_raw", 0))
+            buy_reasons_raw = list(metrics.get("buy_reasons_raw", []))
             buy_score = int(metrics.get("buy_score", 0))
             buy_reasons = list(metrics.get("buy_reasons", []))
 
@@ -767,6 +773,9 @@ def run():
             should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
             raw_should_buy = bool(should_buy)
             raw_buy_reasons = list(buy_reasons)
+            raw_buy_score = int(buy_score)
+            raw_buy_score_pre_mtf = int(buy_score_raw)
+            raw_buy_reasons_pre_mtf = list(buy_reasons_raw)
 
             # Phase A gate: 3m/5m/15m AND consensus + hour score stage
             if enable_mtf_score_sizing:
@@ -971,13 +980,15 @@ def run():
             candidate_log_enabled = env_bool("CANDIDATE_LOG_ENABLED", True)
             if candidate_log_enabled:
                 # log only when there is any buy signal strength or a buy was considered
-                if buy_score > 0 or raw_should_buy or intended_buy:
+                if raw_buy_score_pre_mtf > 0 or buy_score > 0 or raw_should_buy or intended_buy:
                     append_trade_log(trade_log_path, {
                         "ts": int(time.time()),
                         "side": "buy_candidate",
                         "market": market,
                         "price": current_price,
-                        "buy_score": int(buy_score),
+                        "buy_score_pre_mtf": int(raw_buy_score_pre_mtf),
+                        "buy_reasons_pre_mtf": raw_buy_reasons_pre_mtf,
+                        "buy_score_raw": int(raw_buy_score),
                         "buy_threshold": int(active_buy_threshold),
                         "raw_should_buy": bool(raw_should_buy),
                         "final_should_buy": bool(should_buy),
