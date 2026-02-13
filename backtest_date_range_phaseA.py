@@ -153,9 +153,10 @@ def simulate(
     scout_min_score: int = 20,
     pos_min_frac: float = 0.15,
     pos_max_frac: float = 1.0,
-    good_gate_mode: str = "none",  # none|l1|l2
-    good_gate_l1_score: int = 65,
-    good_gate_l2_score: int = 80,
+    good_gate_mode: str = "none",  # none|l1|l2|l3
+    good_gate_l1_score: int = 55,
+    good_gate_l2_score: int = 65,
+    good_gate_l3_score: int = 78,
     fib_lookback: int = 120,
     fib_min: float = 0.382,
     fib_max: float = 0.618,
@@ -179,8 +180,12 @@ def simulate(
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
-    addon_max_l1: int = 2,
-    addon_max_l2: int = 4,
+    addon_max_l1: int = 1,
+    addon_max_l2: int = 2,
+    addon_max_l3: int = 1,
+    addon_frac_l1: float = 0.07,
+    addon_frac_l2: float = 0.10,
+    addon_frac_l3: float = 0.15,
     addon_stop_lift_r: float = -0.2,
     risk_per_trade: float = 0.015,
     mdd_limit_pct: float = 0.30,
@@ -206,6 +211,14 @@ def simulate(
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["adx"] = compute_adx(df, 14)
 
+    # Indicators for gating on H4/D1
+    for _name, _df in [("h4", df240), ("d1", dfd)]:
+        if _df is None or _df.empty or not isinstance(_df.index, pd.DatetimeIndex):
+            continue
+        _df["ema_fast"] = _df["close"].ewm(span=20, adjust=False).mean()
+        _df["ema_slow"] = _df["close"].ewm(span=50, adjust=False).mean()
+        _df["adx"] = compute_adx(_df, 14)
+
     in_pos = False
     entry = stop = 0.0
     risk0 = 0.0
@@ -219,7 +232,7 @@ def simulate(
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
-    addon_counts = {"l1": 0, "l2": 0}
+    addon_counts = {"l1": 0, "l2": 0, "l3": 0}
 
     equity = 1.0
     equity_peak = 1.0
@@ -258,24 +271,50 @@ def simulate(
                         continue
                     pos_frac *= 0.4
 
-                # good-gate context (Level 1/2)
-                # L1 (보수): score>=65 + (proxy) 4h trend ok + d1_ok
-                # L2 (매우 강함): L1 + score>=80 + ADX>=min + close>=EMA20
+                # good-gate context (Level 1/2/3) used for entry labeling / optional entry gating
+                # L1: 현실적 good (2-of-3: score, H4 trend, H4 ADX)
+                # L2: strong (2-of-3: score, D1 trend, D1 ADX)
+                # L3: very strong (3-of-4: score, D1 trend, H4 trend, D1 ADX)
                 sub240 = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
-                h4_ok = mtf_ok(sub240.tail(260)) if (sub240 is not None and len(sub240) >= 220) else False
-                ema_now_ctx = float(row["ema20"]) if pd.notna(row["ema20"]) else 0.0
-                adx_now_ctx = float(row["adx"]) if pd.notna(row["adx"]) else 0.0
+                subd1 = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
 
-                # relaxed definition: L1 doesn't require h4_ok (too idealistic/rare); L2 adds strength filters
-                l1 = (int(s) >= int(good_gate_l1_score)) and bool(d1_ok)
-                l2 = (int(s) >= int(good_gate_l2_score)) and bool(d1_ok) and (adx_now_ctx >= float(adx_min)) and (ema_now_ctx > 0 and float(row["close"]) >= ema_now_ctx)
+                def _last_val(_df, col: str, default: float = 0.0) -> float:
+                    try:
+                        if _df is None or _df.empty or col not in _df.columns:
+                            return float(default)
+                        v = _df[col].iloc[-1]
+                        return float(v) if pd.notna(v) else float(default)
+                    except Exception:
+                        return float(default)
 
-                if str(good_gate_mode).lower() == "l2" and (not l2):
+                h4_fast = _last_val(sub240, "ema_fast")
+                h4_slow = _last_val(sub240, "ema_slow")
+                h4_adx = _last_val(sub240, "adx")
+                d1_fast = _last_val(subd1, "ema_fast")
+                d1_slow = _last_val(subd1, "ema_slow")
+                d1_adx = _last_val(subd1, "adx")
+
+                h4_trend = (h4_fast > 0 and h4_slow > 0 and h4_fast > h4_slow)
+                d1_trend = (d1_fast > 0 and d1_slow > 0 and d1_fast > d1_slow)
+
+                l1_score_ok = int(s) >= int(good_gate_l1_score)
+                l2_score_ok = int(s) >= int(good_gate_l2_score)
+                l3_score_ok = int(s) >= int(good_gate_l3_score)
+
+                l1 = (sum([l1_score_ok, h4_trend, (h4_adx >= 18.0)]) >= 2)
+                l2 = (sum([l2_score_ok, d1_trend, (d1_adx >= float(adx_min))]) >= 2)
+                l3 = (sum([l3_score_ok, d1_trend, h4_trend, (d1_adx >= 25.0)]) >= 3)
+
+                # optional entry gating
+                gmode = str(good_gate_mode).lower()
+                if gmode == "l3" and (not l3):
                     continue
-                if str(good_gate_mode).lower() == "l1" and (not l1):
+                if gmode == "l2" and (not (l2 or l3)):
+                    continue
+                if gmode == "l1" and (not (l1 or l2 or l3)):
                     continue
 
-                entry_ctx = "l2" if l2 else ("l1" if l1 else "other")
+                entry_ctx = "l3" if l3 else ("l2" if l2 else ("l1" if l1 else "other"))
 
                 # 2) Fib pullback zone (soft by default to keep trade frequency)
                 lb = int(max(50, fib_lookback))
@@ -356,21 +395,52 @@ def simulate(
                     h4_ok_now = mtf_ok(sub240_now.tail(260)) if (sub240_now is not None and len(sub240_now) >= 220) else False
                     ema_now_ctx2 = float(row.get("ema20", 0.0) or 0.0)
                     adx_now_ctx2 = float(row.get("adx", 0.0) or 0.0)
-                    l1_now = (int(s_now) >= int(good_gate_l1_score)) and bool(d1_ok_now)
-                    l2_now = (int(s_now) >= int(good_gate_l2_score)) and bool(d1_ok_now) and (adx_now_ctx2 >= float(adx_min)) and (ema_now_ctx2 > 0 and float(row["close"]) >= ema_now_ctx2)
-                    ctx_now = "l2" if l2_now else ("l1" if l1_now else "other")
+                    # compute good-gate levels at current ts
+                    sub240_now = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+                    subd1_now = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+                    h4_fast2 = float(sub240_now["ema_fast"].iloc[-1]) if (not sub240_now.empty and "ema_fast" in sub240_now.columns and pd.notna(sub240_now["ema_fast"].iloc[-1])) else 0.0
+                    h4_slow2 = float(sub240_now["ema_slow"].iloc[-1]) if (not sub240_now.empty and "ema_slow" in sub240_now.columns and pd.notna(sub240_now["ema_slow"].iloc[-1])) else 0.0
+                    h4_adx2 = float(sub240_now["adx"].iloc[-1]) if (not sub240_now.empty and "adx" in sub240_now.columns and pd.notna(sub240_now["adx"].iloc[-1])) else 0.0
+                    d1_fast2 = float(subd1_now["ema_fast"].iloc[-1]) if (not subd1_now.empty and "ema_fast" in subd1_now.columns and pd.notna(subd1_now["ema_fast"].iloc[-1])) else 0.0
+                    d1_slow2 = float(subd1_now["ema_slow"].iloc[-1]) if (not subd1_now.empty and "ema_slow" in subd1_now.columns and pd.notna(subd1_now["ema_slow"].iloc[-1])) else 0.0
+                    d1_adx2 = float(subd1_now["adx"].iloc[-1]) if (not subd1_now.empty and "adx" in subd1_now.columns and pd.notna(subd1_now["adx"].iloc[-1])) else 0.0
 
-                    if mode_gate in ("l1", "l2"):
-                        good_now = (l2_now if mode_gate == "l2" else (l1_now or l2_now))
+                    h4_trend2 = (h4_fast2 > 0 and h4_slow2 > 0 and h4_fast2 > h4_slow2)
+                    d1_trend2 = (d1_fast2 > 0 and d1_slow2 > 0 and d1_fast2 > d1_slow2)
+
+                    l1_now = (sum([(int(s_now) >= int(good_gate_l1_score)), h4_trend2, (h4_adx2 >= 18.0)]) >= 2)
+                    l2_now = (sum([(int(s_now) >= int(good_gate_l2_score)), d1_trend2, (d1_adx2 >= float(adx_min))]) >= 2)
+                    l3_now = (sum([(int(s_now) >= int(good_gate_l3_score)), d1_trend2, h4_trend2, (d1_adx2 >= 25.0)]) >= 3)
+                    ctx_now = "l3" if l3_now else ("l2" if l2_now else ("l1" if l1_now else "other"))
+
+                    if mode_gate == "l3":
+                        good_now = bool(l3_now)
+                    elif mode_gate == "l2":
+                        good_now = bool(l2_now or l3_now)
+                    elif mode_gate == "l1":
+                        good_now = bool(l1_now or l2_now or l3_now)
                     else:
-                        good_now = (l1_now or l2_now)
+                        good_now = bool(l1_now or l2_now or l3_now)
 
                     gate_hold = (gate_hold + 1) if good_now else 0
 
                     # decide addon allowance by ctx
-                    max_addons = int(addon_max_l2) if ctx_now == "l2" else int(addon_max_l1)
+                    # add-on only when in-profit (R>0), to avoid averaging down.
+                    unreal_r = (float(row["close"]) - float(entry)) / max(1e-9, float(risk_unit))
+
+                    if ctx_now == "l3":
+                        max_addons = int(addon_max_l3)
+                        add_f = float(addon_frac_l3)
+                    elif ctx_now == "l2":
+                        max_addons = int(addon_max_l2)
+                        add_f = float(addon_frac_l2)
+                    else:
+                        max_addons = int(addon_max_l1)
+                        add_f = float(addon_frac_l1)
+
                     can_add = (
                         good_now
+                        and (unreal_r > 0.0)
                         and (gate_hold >= int(addon_hold_bars))
                         and ((i - int(last_addon_i)) >= int(addon_min_bars))
                         and (int(addon_count) < int(max_addons))
@@ -378,14 +448,12 @@ def simulate(
                     )
 
                     if can_add:
-                        fracs = parse_csv_floats(str(addon_fracs), [0.10, 0.07, 0.05, 0.03])
-                        add_f = float(fracs[int(addon_count)]) if int(addon_count) < len(fracs) else float(fracs[-1])
-                        new_pos = min(float(pos_cap_total), float(pos_frac) + max(0.0, add_f))
+                        new_pos = min(float(pos_cap_total), float(pos_frac) + max(0.0, float(add_f)))
                         if new_pos > float(pos_frac) + 1e-9:
                             pos_frac = new_pos
                             addon_count += 1
                             last_addon_i = i
-                            if ctx_now in ("l1", "l2"):
+                            if ctx_now in ("l1", "l2", "l3"):
                                 addon_counts[ctx_now] = int(addon_counts.get(ctx_now, 0)) + 1
                             # lift stop along with add-on (risk sync)
                             stop = max(float(stop), float(entry) + float(risk_unit) * float(addon_stop_lift_r))
@@ -535,14 +603,19 @@ def simulate(
         "pyramiding": {
             "enabled": bool(pyramiding_enabled),
             "pos_cap_total": float(pos_cap_total),
-            "addon_fracs": str(addon_fracs),
             "addon_min_bars": int(addon_min_bars),
             "addon_hold_bars": int(addon_hold_bars),
             "addon_max_l1": int(addon_max_l1),
             "addon_max_l2": int(addon_max_l2),
+            "addon_max_l3": int(addon_max_l3),
+            "addon_frac_l1": float(addon_frac_l1),
+            "addon_frac_l2": float(addon_frac_l2),
+            "addon_frac_l3": float(addon_frac_l3),
             "addon_counts": addon_counts,
         },
+        "equity_start": 1.0,
         "equity_end": round(float(equity), 4),
+        "return_pct": round((float(equity) - 1.0) * 100.0, 2),
         "mdd_pct": round(float(mdd_pct), 4),
         "mdd_ok": bool(mdd_ok),
         "trades": total,
@@ -583,18 +656,22 @@ def main():
     ap.add_argument("--scout-min-score", type=int, default=20)
     ap.add_argument("--pos-min-frac", type=float, default=0.15)
     ap.add_argument("--pos-max-frac", type=float, default=1.0)
-    ap.add_argument("--good-gate-mode", type=str, default="none", help="none|l1|l2")
-    ap.add_argument("--good-gate-l1-score", type=int, default=65)
-    ap.add_argument("--good-gate-l2-score", type=int, default=80)
+    ap.add_argument("--good-gate-mode", type=str, default="none", help="none|l1|l2|l3")
+    ap.add_argument("--good-gate-l1-score", type=int, default=55)
+    ap.add_argument("--good-gate-l2-score", type=int, default=65)
+    ap.add_argument("--good-gate-l3-score", type=int, default=78)
 
     # Pyramiding(scale-in) knobs
     ap.add_argument("--pyramiding", action="store_true", help="Enable pyramiding(scale-in)")
     ap.add_argument("--pos-cap-total", type=float, default=0.90)
-    ap.add_argument("--addon-fracs", type=str, default="0.10,0.07,0.05,0.03")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
-    ap.add_argument("--addon-max-l1", type=int, default=2)
-    ap.add_argument("--addon-max-l2", type=int, default=4)
+    ap.add_argument("--addon-max-l1", type=int, default=1)
+    ap.add_argument("--addon-max-l2", type=int, default=2)
+    ap.add_argument("--addon-max-l3", type=int, default=1)
+    ap.add_argument("--addon-frac-l1", type=float, default=0.07)
+    ap.add_argument("--addon-frac-l2", type=float, default=0.10)
+    ap.add_argument("--addon-frac-l3", type=float, default=0.15)
     ap.add_argument("--addon-stop-lift-r", type=float, default=-0.2)
     ap.add_argument("--risk-per-trade", type=float, default=0.015)
     ap.add_argument("--mdd-limit-pct", type=float, default=0.30)
@@ -638,13 +715,17 @@ def main():
         good_gate_mode=str(args.good_gate_mode),
         good_gate_l1_score=int(args.good_gate_l1_score),
         good_gate_l2_score=int(args.good_gate_l2_score),
+        good_gate_l3_score=int(args.good_gate_l3_score),
         pyramiding_enabled=bool(args.pyramiding),
         pos_cap_total=float(args.pos_cap_total),
-        addon_fracs=str(args.addon_fracs),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
         addon_max_l2=int(args.addon_max_l2),
+        addon_max_l3=int(args.addon_max_l3),
+        addon_frac_l1=float(args.addon_frac_l1),
+        addon_frac_l2=float(args.addon_frac_l2),
+        addon_frac_l3=float(args.addon_frac_l3),
         addon_stop_lift_r=float(args.addon_stop_lift_r),
         risk_per_trade=float(args.risk_per_trade),
         mdd_limit_pct=float(args.mdd_limit_pct),
