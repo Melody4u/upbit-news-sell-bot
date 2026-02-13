@@ -74,9 +74,14 @@ $run = [ordered]@{
 }
 
 try {
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2023-01-01' -end '2024-01-01' -tag 'Y2023')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2024-01-01' -end '2025-01-01' -tag 'Y2024')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-01-01' -end '2026-01-01' -tag 'Y2025')
+  # Half-year slices + 2025Q4 (stress)
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2023-01-01' -end '2023-07-01' -tag '2023H1')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2023-07-01' -end '2024-01-01' -tag '2023H2')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2024-01-01' -end '2024-07-01' -tag '2024H1')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2024-07-01' -end '2025-01-01' -tag '2024H2')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-01-01' -end '2025-07-01' -tag '2025H1')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-07-01' -end '2026-01-01' -tag '2025H2')
+  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-10-01' -end '2026-01-01' -tag '2025Q4')
 } catch {
   $run.error = $_.Exception.Message
 }
