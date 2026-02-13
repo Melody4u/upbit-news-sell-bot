@@ -164,6 +164,7 @@ def simulate(
     d1_slope_lookback: int = 5,
     tp1_r: float = 0.8,
     tp2_r: float = 1.6,
+    rr_target_atr_mult: float = 1.0,
     tp1_ratio: float = 0.6,
     be_offset_bps: float = 8.0,
     be_move_mode: str = "hybrid",  # always|weak_only|hybrid
@@ -366,8 +367,10 @@ def simulate(
                 tp2 = entry + (atr * float(tp2_r))
                 tp = tp2
             else:
-                tp = entry + atr * float(min_rr)
+                # basic RR target using ATR multiple
+                tp = entry + atr * float(rr_target_atr_mult)
                 tp1 = tp2 = 0.0
+            # (basic RR mode handled above)
             if entry <= stop:
                 continue
             partial_done = False
@@ -631,7 +634,7 @@ def simulate(
         "mtf_weights": weights,
         "fib": {"lookback": fib_lookback, "min": fib_min, "max": fib_max, "swing_confirm": fib_swing_confirm},
         "d1_slope_lookback": d1_slope_lookback,
-        "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps, "be_move_mode": be_move_mode, "be_strong_stop_r": be_strong_stop_r, "adx_min": adx_min},
+        "tp": {"tp1_r": tp1_r, "tp2_r": tp2_r, "rr_target_atr_mult": rr_target_atr_mult, "tp1_ratio": tp1_ratio, "be_offset_bps": be_offset_bps, "be_move_mode": be_move_mode, "be_strong_stop_r": be_strong_stop_r, "adx_min": adx_min},
         "early_fail": {
             "enabled": early_fail_enabled,
             "mode": early_fail_mode,
@@ -684,6 +687,7 @@ def main():
     ap.add_argument("--d1-slope-lookback", type=int, default=5)
     ap.add_argument("--tp1-r", type=float, default=0.8)
     ap.add_argument("--tp2-r", type=float, default=1.6)
+    ap.add_argument("--rr-target-atr-mult", type=float, default=1.0)
     ap.add_argument("--tp1-ratio", type=float, default=0.6)
     ap.add_argument("--be-offset-bps", type=float, default=8.0)
     ap.add_argument("--be-move-mode", type=str, default="hybrid", help="always|weak_only|hybrid")
@@ -736,6 +740,7 @@ def main():
         d1_slope_lookback=int(args.d1_slope_lookback),
         tp1_r=float(args.tp1_r),
         tp2_r=float(args.tp2_r),
+        rr_target_atr_mult=float(args.rr_target_atr_mult),
         tp1_ratio=float(args.tp1_ratio),
         be_offset_bps=float(args.be_offset_bps),
         be_move_mode=str(args.be_move_mode),
