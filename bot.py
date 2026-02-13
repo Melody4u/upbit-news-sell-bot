@@ -387,7 +387,9 @@ def run():
     early_fail_levels_r = parse_float_list_csv(os.getenv("EARLY_FAIL_LEVELS_R", "0.6,0.9,1.2,1.6,2.0"), [0.6, 0.9, 1.2, 1.6, 2.0])
     early_fail_cut_ratios = parse_float_list_csv(os.getenv("EARLY_FAIL_CUT_RATIOS", "0.1,0.3,0.5,0.7,1.0"), [0.1, 0.3, 0.5, 0.7, 1.0])
     early_fail_max_cut_ratio = get_env_float("EARLY_FAIL_MAX_CUT_RATIO", 1.0)
-    early_fail_mode = os.getenv("EARLY_FAIL_MODE", "weak_trend_only").lower()  # weak_trend_only|always
+    early_fail_mode = os.getenv("EARLY_FAIL_MODE", "weak_trend_only").lower()  # weak_trend_only|always|hybrid
+    early_fail_strong_levels_r = parse_float_list_csv(os.getenv("EARLY_FAIL_STRONG_LEVELS_R", "1.6,2.0"), [1.6, 2.0])
+    early_fail_strong_cut_ratios = parse_float_list_csv(os.getenv("EARLY_FAIL_STRONG_CUT_RATIOS", "0.5,1.0"), [0.5, 1.0])
     if len(partial_tp_levels) != len(partial_tp_ratios):
         logging.warning("PARTIAL_TP length mismatch | levels=%s ratios=%s -> truncating to min length", len(partial_tp_levels), len(partial_tp_ratios))
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
@@ -1077,11 +1079,19 @@ def run():
 
                 # Early fail cut ladder (negative R): cut portions as loss deepens
                 weak_trend_ctx = (metrics.get("adx", 0) < float(cfg["ADX_MIN"])) or (last_close < float(metrics.get("ma20", 0) or 0))
-                early_fail_ctx_ok = (early_fail_mode == "always") or weak_trend_ctx or (not mtf_trend_ok) or downtrend_block
-                if early_fail_cut_enabled and early_fail_ctx_ok and r_now < 0 and early_fail_levels_r and early_fail_cut_ratios:
+
+                # hybrid policy: cut more aggressively in weak trend; preserve right-tail in strong trend
+                if early_fail_mode == "hybrid" and (not (weak_trend_ctx or (not mtf_trend_ok) or downtrend_block)):
+                    n = min(len(early_fail_strong_levels_r), len(early_fail_strong_cut_ratios))
+                    cut_levels = early_fail_strong_levels_r[:n]
+                    cut_ratios = early_fail_strong_cut_ratios[:n]
+                else:
                     n = min(len(early_fail_levels_r), len(early_fail_cut_ratios))
                     cut_levels = early_fail_levels_r[:n]
                     cut_ratios = early_fail_cut_ratios[:n]
+
+                early_fail_ctx_ok = (early_fail_mode == "always") or (early_fail_mode == "hybrid") or weak_trend_ctx or (not mtf_trend_ok) or downtrend_block
+                if early_fail_cut_enabled and early_fail_ctx_ok and r_now < 0 and cut_levels and cut_ratios:
                     # clamp
                     max_cut = min(1.0, max(0.0, float(early_fail_max_cut_ratio)))
                     for lvl, ratio in zip(cut_levels, cut_ratios):
