@@ -21,7 +21,7 @@ from tradingbot.data.exchange_client import (
     get_spread_bps,
     get_order_state,
 )
-from tradingbot.execution.broker import place_order_with_retry, verify_position_change
+from tradingbot.execution.broker import place_order_with_retry, verify_position_change, place_buy_entry_order
 from tradingbot.notifications import notify_event
 from tradingbot.risk.news import NewsState, fetch_negative_news_score
 from tradingbot.risk.market_risk import load_market_risk, resolve_risk_mode, apply_risk_mode
@@ -310,6 +310,15 @@ def run():
     buy_ratio = get_env_float("BUY_RATIO", 0.25)
     min_sell_krw = get_env_float("MIN_SELL_KRW", 5000)
     min_buy_krw = get_env_float("MIN_BUY_KRW", 5000)
+
+    # Plan C: limit entry order (optional). Default keeps existing market order behavior.
+    buy_entry_order_mode = os.getenv("BUY_ENTRY_ORDER_MODE", "market").lower()  # market|limit
+    buy_limit_offset_bps = get_env_float("BUY_LIMIT_OFFSET_BPS", 5.0)
+    buy_limit_timeout_sec = get_env_int("BUY_LIMIT_TIMEOUT_SEC", 15)
+    buy_limit_price_tick_method = os.getenv("BUY_LIMIT_PRICE_TICK_METHOD", "ceil").lower()  # ceil|floor
+    buy_limit_fee_rate = get_env_float("UPBIT_FEE_RATE", 0.0005)
+    buy_limit_volume_decimals = get_env_int("BUY_LIMIT_VOLUME_DECIMALS", 8)
+    buy_limit_timeout_action = os.getenv("BUY_LIMIT_TIMEOUT_ACTION", "skip").lower()  # skip only
     check_seconds = get_env_int("CHECK_SECONDS", 30)
 
     brave_key = os.getenv("BRAVE_API_KEY", "")
@@ -572,7 +581,22 @@ def run():
                     logging.warning("pending order check error: %s", order_obj)
                 else:
                     logging.info("pending order wait | side=%s state=%s age=%ss", pending_order.get("side"), st, age_sec)
-                    if age_sec >= pending_order_timeout_sec and not pending_order.get("timeout_notified", False):
+
+                    # Plan C: buy_limit timeout -> cancel; default action is 'skip' (no market fallback)
+                    if pending_order.get("kind") == "buy_limit":
+                        timeout_sec = int(pending_order.get("timeout_sec", pending_order_timeout_sec))
+                        if age_sec >= timeout_sec and not pending_order.get("cancel_requested", False):
+                            try:
+                                upbit.cancel_order(pending_order.get("uuid"))
+                                pending_order["cancel_requested"] = True
+                                notify_event(alert_webhook_url, alert_events, "rejected", f"buy_limit_timeout_cancelled market={pending_order.get('market', market)} age={age_sec}s")
+                            except Exception as e:
+                                logging.warning("buy_limit cancel failed: %s", e)
+
+                            if buy_limit_timeout_action == "skip":
+                                pending_order = None
+
+                    if age_sec >= pending_order_timeout_sec and pending_order and not pending_order.get("timeout_notified", False):
                         msg = f"pending_order_timeout side={pending_order.get('side')} age={age_sec}s state={st}"
                         notify_event(alert_webhook_url, alert_events, "rejected", msg)
                         append_trade_log(trade_log_path, {
@@ -1361,11 +1385,22 @@ def run():
                             early_fail_done = set()
                     else:
                         before_coin, before_krw = coin_balance, krw_balance
-                        notify_event(alert_webhook_url, alert_events, "order_sent", f"buy sent {market} krw={buy_krw:.0f}")
-                        result = place_order_with_retry("buy_market_order", upbit.buy_market_order, market, buy_krw)
-                        logging.warning("buy_market_order result: %s", result)
+                        notify_event(alert_webhook_url, alert_events, "order_sent", f"buy sent {market} krw={buy_krw:.0f} mode={buy_entry_order_mode}")
+                        result, buy_pending = place_buy_entry_order(
+                            upbit,
+                            market,
+                            buy_krw,
+                            mode=buy_entry_order_mode,
+                            offset_bps=buy_limit_offset_bps,
+                            timeout_sec=buy_limit_timeout_sec,
+                            fee_rate=buy_limit_fee_rate,
+                            vol_decimals=buy_limit_volume_decimals,
+                            price_tick_method=buy_limit_price_tick_method,
+                            min_buy_krw=min_buy_krw,
+                        )
+                        logging.warning("buy_entry_order result: %s", result)
                         order_uuid = result.get("uuid") if isinstance(result, dict) else None
-                        pending_order = {"uuid": order_uuid, "side": "buy", "created_ts": now_ts, "timeout_notified": False} if order_uuid else None
+                        pending_order = buy_pending if buy_pending is not None else ({"uuid": order_uuid, "side": "buy", "created_ts": now_ts, "timeout_notified": False} if order_uuid else None)
                         time.sleep(1.0)
                         after_coin, _, _ = get_account_state(upbit, market)
                         after_krw = get_krw_balance(upbit)
@@ -1419,7 +1454,7 @@ def run():
                             "dry_run": dry_run,
                         })
                         if not dry_run:
-                            notify_event(alert_webhook_url, alert_events, "order_sent", f"buy_addon sent {market} krw={addon_krw:.0f}")
+                            notify_event(alert_webhook_url, alert_events, "order_sent", f"buy_addon sent {market} krw={addon_krw:.0f} mode=market")
                             result = place_order_with_retry("buy_addon_market_order", upbit.buy_market_order, market, addon_krw)
                             logging.warning("buy_addon result: %s", result)
                         last_buy_ts = now_ts
