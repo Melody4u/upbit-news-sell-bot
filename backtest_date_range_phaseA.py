@@ -195,6 +195,9 @@ def simulate(
     swing_stop_enabled: bool = True,
     swing_stop_lookback: int = 20,
     swing_stop_confirm_bars: int = 2,
+    vol_spike_block_enabled: bool = False,
+    vol_spike_block_atr_mult: float = 2.5,
+    vol_spike_block_hold_bars: int = 2,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -253,6 +256,9 @@ def simulate(
     r_total_pos = 0.0
     swing_break_count = 0
 
+    # volatility spike block state (entry/add-on cooldown after extreme bar)
+    vol_block_until_i = -1
+
     legs = []  # execution legs: early_cut/tp1/rem
     positions = []  # per-entry totals
 
@@ -263,6 +269,10 @@ def simulate(
         atr = float(row["atr"]) if pd.notna(row["atr"]) else 0.0
         if atr <= 0:
             continue
+
+        close = float(row["close"])
+        high = float(row["high"])
+        low = float(row["low"])
 
         if not in_pos:
             # Downtrend gate (하락추세): block entries depending on mode
@@ -292,6 +302,15 @@ def simulate(
             downtrend = (h4_down or d1_down) if dm == "or" else (h4_down if dm == "h4" else (d1_down if dm == "d1" else False))
             if downtrend:
                 continue
+
+            # Volatility spike block: after an extreme bar, skip new entries for N bars
+            if vol_spike_block_enabled:
+                if i <= int(vol_block_until_i):
+                    continue
+                bar_range = float(high - low)
+                if bar_range >= float(vol_spike_block_atr_mult) * float(atr):
+                    vol_block_until_i = int(i) + int(max(1, vol_spike_block_hold_bars))
+                    continue
 
             # keep for later (position management)
             downtrend_entry = bool(downtrend)
@@ -807,6 +826,9 @@ def main():
     ap.add_argument("--swing-stop", action="store_true", help="Enable swing-low structure stop in downtrend")
     ap.add_argument("--swing-stop-lookback", type=int, default=20)
     ap.add_argument("--swing-stop-confirm-bars", type=int, default=2)
+    ap.add_argument("--vol-spike-block", action="store_true", help="Block entries after extreme range bar")
+    ap.add_argument("--vol-spike-atr-mult", type=float, default=2.5)
+    ap.add_argument("--vol-spike-hold-bars", type=int, default=2)
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -867,6 +889,9 @@ def main():
         swing_stop_enabled=bool(args.swing_stop),
         swing_stop_lookback=int(args.swing_stop_lookback),
         swing_stop_confirm_bars=int(args.swing_stop_confirm_bars),
+        vol_spike_block_enabled=bool(args.vol_spike_block),
+        vol_spike_block_atr_mult=float(args.vol_spike_atr_mult),
+        vol_spike_block_hold_bars=int(args.vol_spike_hold_bars),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
