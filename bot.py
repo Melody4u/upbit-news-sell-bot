@@ -27,6 +27,17 @@ from tradingbot.risk.news import NewsState, fetch_negative_news_score
 from tradingbot.risk.market_risk import load_market_risk, resolve_risk_mode, apply_risk_mode
 
 
+def _atomic_write_text(path: str, text: str) -> None:
+    """Best-effort atomic write (write temp then replace)."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -366,8 +377,10 @@ def run():
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
     spread_bps_max = get_env_float("SPREAD_BPS_MAX", 12)
     post_entry_cooldown_bars = get_env_int("POST_ENTRY_COOLDOWN_BARS", 3)
-    partial_tp_levels = parse_float_list_csv(os.getenv("PARTIAL_TP_LEVELS", "1.0,2.0"), [1.0, 2.0])
-    partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.3,0.3"), [0.3, 0.3])
+    partial_tp_levels = parse_float_list_csv(os.getenv("PARTIAL_TP_LEVELS", "0.7,1.4"), [0.7, 1.4])
+    partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.6,0.4"), [0.6, 0.4])
+    move_stop_to_be_after_tp1 = env_bool("MOVE_STOP_TO_BE_AFTER_TP1", True)
+    be_offset_bps = get_env_float("BE_OFFSET_BPS", 8.0)
     if len(partial_tp_levels) != len(partial_tp_ratios):
         logging.warning("PARTIAL_TP length mismatch | levels=%s ratios=%s -> truncating to min length", len(partial_tp_levels), len(partial_tp_ratios))
     n_tp = min(len(partial_tp_levels), len(partial_tp_ratios))
@@ -476,12 +489,26 @@ def run():
     trailing_peak_price = float(runtime_state.get("trailing_peak_price", 0.0) or 0.0)
     prev_halted = bool(runtime_state.get("halted", False))
 
+    # PID/heartbeat for watchdog (avoid fragile CommandLine matching)
+    pid_path = os.getenv("PID_PATH", "logs/bot.pid")
+    heartbeat_path = os.getenv("HEARTBEAT_PATH", "logs/bot.heartbeat")
+    try:
+        _atomic_write_text(pid_path, str(os.getpid()))
+        _atomic_write_text(heartbeat_path, str(time.time()))
+    except Exception as e:
+        logging.warning("failed to write pid/heartbeat | err=%s", e)
+
     logging.info("bot started | market=%s dry_run=%s entry_mode=%s", market, dry_run, entry_mode)
     loop_error_count = 0
 
     while True:
         try:
             now = time.time()
+            # heartbeat: updated at top of loop so watchdog can detect stalls
+            try:
+                _atomic_write_text(heartbeat_path, str(now))
+            except Exception:
+                pass
 
             if brave_key and (now - news_state.last_checked >= news_interval_seconds):
                 score, headlines = fetch_negative_news_score(
@@ -1071,6 +1098,12 @@ def run():
                             if filled_tp:
                                 partial_tp_done.add(key)
                                 runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
+                                # Optional: after first partial TP, move stop to breakeven (+fees buffer)
+                                if move_stop_to_be_after_tp1 and len(partial_tp_done) == 1 and avg_buy_price > 0:
+                                    be_price = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
+                                    if last_buy_stop_price is None or be_price > float(last_buy_stop_price):
+                                        last_buy_stop_price = float(be_price)
+                                        signal_reasons.append(f"be_stop_after_tp1({be_offset_bps:.1f}bps)")
                                 partial_tp_executed = True
                         break
 
