@@ -1,0 +1,2 @@
+# If this file exists, Windows Startup will keep the bot alive via watchdog.
+# Delete this file to disable autostart.
