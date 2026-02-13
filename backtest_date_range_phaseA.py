@@ -174,6 +174,16 @@ def simulate(
     early_fail_cut_ratios: str = "0.1,0.3,0.5,0.7,1.0",
     early_fail_strong_levels_r: str = "1.6,2.0",
     early_fail_strong_cut_ratios: str = "0.5,1.0",
+    pyramiding_enabled: bool = True,
+    pos_cap_total: float = 0.90,
+    addon_fracs: str = "0.10,0.07,0.05,0.03",
+    addon_min_bars: int = 1,
+    addon_hold_bars: int = 2,
+    addon_max_l1: int = 2,
+    addon_max_l2: int = 4,
+    addon_stop_lift_r: float = -0.2,
+    risk_per_trade: float = 0.015,
+    mdd_limit_pct: float = 0.30,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -206,6 +216,15 @@ def simulate(
     pos_frac = 1.0
     entry_ctx = ""
     entry_ctx_counts = {"l1": 0, "l2": 0, "other": 0}
+    addon_count = 0
+    last_addon_i = -10_000
+    gate_hold = 0
+    addon_counts = {"l1": 0, "l2": 0}
+
+    equity = 1.0
+    equity_peak = 1.0
+    mdd_pct = 0.0
+
     trades = []
 
     for i in range(220, len(df)):
@@ -314,6 +333,9 @@ def simulate(
             partial_done = False
             early_cut_done = False
             in_pos = True
+            addon_count = 0
+            last_addon_i = i
+            gate_hold = 0
             entry_ctx_counts[entry_ctx] = int(entry_ctx_counts.get(entry_ctx, 0)) + 1
         else:
             low = float(row["low"])
@@ -323,6 +345,50 @@ def simulate(
             risk_unit = max(1e-9, float(risk0))
 
             if highwr_v1:
+                # Pyramiding(scale-in): expand position only when L1/L2 holds; cap total exposure
+                if pyramiding_enabled and wallst_v1:
+                    mode_gate = str(good_gate_mode or "none").lower()
+                    # compute current ctx (same proxy as entry)
+                    s_now = score_mtf(ts, df_by_itv, weights)
+                    d1_ok_now = d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback)
+                    sub240_now = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+                    h4_ok_now = mtf_ok(sub240_now.tail(260)) if (sub240_now is not None and len(sub240_now) >= 220) else False
+                    ema_now_ctx2 = float(row.get("ema20", 0.0) or 0.0)
+                    adx_now_ctx2 = float(row.get("adx", 0.0) or 0.0)
+                    l1_now = (int(s_now) >= int(good_gate_l1_score)) and bool(h4_ok_now) and bool(d1_ok_now)
+                    l2_now = l1_now and (int(s_now) >= int(good_gate_l2_score)) and (adx_now_ctx2 >= float(adx_min)) and (ema_now_ctx2 > 0 and float(row["close"]) >= ema_now_ctx2)
+                    ctx_now = "l2" if l2_now else ("l1" if l1_now else "other")
+
+                    if mode_gate in ("l1", "l2"):
+                        good_now = (l2_now if mode_gate == "l2" else (l1_now or l2_now))
+                    else:
+                        good_now = (l1_now or l2_now)
+
+                    gate_hold = (gate_hold + 1) if good_now else 0
+
+                    # decide addon allowance by ctx
+                    max_addons = int(addon_max_l2) if ctx_now == "l2" else int(addon_max_l1)
+                    can_add = (
+                        good_now
+                        and (gate_hold >= int(addon_hold_bars))
+                        and ((i - int(last_addon_i)) >= int(addon_min_bars))
+                        and (int(addon_count) < int(max_addons))
+                        and (float(pos_frac) < float(pos_cap_total) - 1e-9)
+                    )
+
+                    if can_add:
+                        fracs = parse_csv_floats(str(addon_fracs), [0.10, 0.07, 0.05, 0.03])
+                        add_f = float(fracs[int(addon_count)]) if int(addon_count) < len(fracs) else float(fracs[-1])
+                        new_pos = min(float(pos_cap_total), float(pos_frac) + max(0.0, add_f))
+                        if new_pos > float(pos_frac) + 1e-9:
+                            pos_frac = new_pos
+                            addon_count += 1
+                            last_addon_i = i
+                            if ctx_now in ("l1", "l2"):
+                                addon_counts[ctx_now] = int(addon_counts.get(ctx_now, 0)) + 1
+                            # lift stop along with add-on (risk sync)
+                            stop = max(float(stop), float(entry) + float(risk_unit) * float(addon_stop_lift_r))
+
                 # Multi-leg exit
                 # Early fail cut: ladder in R, mode controls aggressiveness
                 if early_fail_enabled and (not early_cut_done):
@@ -352,7 +418,11 @@ def simulate(
                                 gross_r_cut = (cut_price - entry) / risk_unit
                                 cost_leg = (cost_bps / 10000.0) * 2.0
                                 net_r_cut = gross_r_cut - (cost_leg / max(1e-9, risk_unit / entry))
-                                trades.append({"result": "loss", "r": float(net_r_cut) * float(ratio) * float(pos_frac), "leg": f"early_cut_{lvl:.2f}R"})
+                                r_leg = float(net_r_cut) * float(ratio) * float(pos_frac)
+                                trades.append({"result": "loss", "r": r_leg, "leg": f"early_cut_{lvl:.2f}R"})
+                                equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
+                                equity_peak = max(equity_peak, equity)
+                                mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
                                 early_cut_done = True
                                 break
 
@@ -363,7 +433,11 @@ def simulate(
                     # cost for this leg (entry+partial exit). assume round trip on that fraction
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
-                    trades.append({"result": "win", "r": float(net_r1) * float(tp1_ratio) * float(pos_frac), "leg": "tp1"})
+                    r_leg = float(net_r1) * float(tp1_ratio) * float(pos_frac)
+                    trades.append({"result": "win", "r": r_leg, "leg": "tp1"})
+                    equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
+                    equity_peak = max(equity_peak, equity)
+                    mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
                     partial_done = True
                     # move stop (context-aware): protect in weak trend, preserve right-tail in strong trend
                     mode_be = str(be_move_mode or "hybrid").lower()
@@ -406,7 +480,11 @@ def simulate(
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
                     remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
-                    trades.append({"result": result, "r": float(net_r) * float(remain_ratio) * float(pos_frac), "leg": "rem"})
+                    r_leg = float(net_r) * float(remain_ratio) * float(pos_frac)
+                    trades.append({"result": result, "r": r_leg, "leg": "rem"})
+                    equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
+                    equity_peak = max(equity_peak, equity)
+                    mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
                     in_pos = False
 
             else:
@@ -441,6 +519,8 @@ def simulate(
     pf = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
     avg_r = float(np.mean([t["r"] for t in trades])) if trades else 0.0
 
+    mdd_ok = bool(float(mdd_pct) <= float(mdd_limit_pct))
+
     return {
         "market": market,
         "start": str(start.date()),
@@ -451,6 +531,19 @@ def simulate(
         "scout_min_score": int(scout_min_score),
         "pos_frac": {"min": float(pos_min_frac), "max": float(pos_max_frac)},
         "good_gate": {"mode": str(good_gate_mode), "l1_score": int(good_gate_l1_score), "l2_score": int(good_gate_l2_score), "entry_ctx_counts": entry_ctx_counts},
+        "pyramiding": {
+            "enabled": bool(pyramiding_enabled),
+            "pos_cap_total": float(pos_cap_total),
+            "addon_fracs": str(addon_fracs),
+            "addon_min_bars": int(addon_min_bars),
+            "addon_hold_bars": int(addon_hold_bars),
+            "addon_max_l1": int(addon_max_l1),
+            "addon_max_l2": int(addon_max_l2),
+            "addon_counts": addon_counts,
+        },
+        "equity_end": round(float(equity), 4),
+        "mdd_pct": round(float(mdd_pct), 4),
+        "mdd_ok": bool(mdd_ok),
         "trades": total,
         "trades_per_month": round(float(trades_per_month), 2),
         "wins": wins,
@@ -492,6 +585,18 @@ def main():
     ap.add_argument("--good-gate-mode", type=str, default="none", help="none|l1|l2")
     ap.add_argument("--good-gate-l1-score", type=int, default=65)
     ap.add_argument("--good-gate-l2-score", type=int, default=80)
+
+    # Pyramiding(scale-in) knobs
+    ap.add_argument("--pyramiding", action="store_true", help="Enable pyramiding(scale-in)")
+    ap.add_argument("--pos-cap-total", type=float, default=0.90)
+    ap.add_argument("--addon-fracs", type=str, default="0.10,0.07,0.05,0.03")
+    ap.add_argument("--addon-min-bars", type=int, default=1)
+    ap.add_argument("--addon-hold-bars", type=int, default=2)
+    ap.add_argument("--addon-max-l1", type=int, default=2)
+    ap.add_argument("--addon-max-l2", type=int, default=4)
+    ap.add_argument("--addon-stop-lift-r", type=float, default=-0.2)
+    ap.add_argument("--risk-per-trade", type=float, default=0.015)
+    ap.add_argument("--mdd-limit-pct", type=float, default=0.30)
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -532,6 +637,16 @@ def main():
         good_gate_mode=str(args.good_gate_mode),
         good_gate_l1_score=int(args.good_gate_l1_score),
         good_gate_l2_score=int(args.good_gate_l2_score),
+        pyramiding_enabled=bool(args.pyramiding),
+        pos_cap_total=float(args.pos_cap_total),
+        addon_fracs=str(args.addon_fracs),
+        addon_min_bars=int(args.addon_min_bars),
+        addon_hold_bars=int(args.addon_hold_bars),
+        addon_max_l1=int(args.addon_max_l1),
+        addon_max_l2=int(args.addon_max_l2),
+        addon_stop_lift_r=float(args.addon_stop_lift_r),
+        risk_per_trade=float(args.risk_per_trade),
+        mdd_limit_pct=float(args.mdd_limit_pct),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
