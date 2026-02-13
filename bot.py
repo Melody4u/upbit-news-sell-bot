@@ -347,6 +347,13 @@ def run():
     hard_stop_pct = get_env_float("HARD_STOP_PCT", 0.10)
     hard_stop_recovery_window_sec = get_env_int("HARD_STOP_RECOVERY_WINDOW_SEC", 86400)
 
+    # regime + pullback (Phase B-lite)
+    downtrend_block_enabled = env_bool("DOWNTREND_BLOCK_ENABLED", True)
+    fib_pullback_enabled = env_bool("FIB_PULLBACK_ENABLED", False)
+    fib_lookback = get_env_int("FIB_LOOKBACK", 120)
+    fib_min = get_env_float("FIB_MIN", 0.382)
+    fib_max = get_env_float("FIB_MAX", 0.618)
+
     rr_min = get_env_float("MIN_RR", 2.5)
     rr_target_atr_mult = get_env_float("RR_TARGET_ATR_MULT", 2.0)
     spread_bps_max = get_env_float("SPREAD_BPS_MAX", 12)
@@ -639,20 +646,31 @@ def run():
             df_mtf = pyupbit.get_ohlcv(market, interval=mtf_interval, count=max(mtf_lookback, 220))
             df_mtf_2 = pyupbit.get_ohlcv(market, interval=mtf_interval_2, count=max(mtf_lookback, 220))
 
-            def _mtf_ok(_df):
+            def _mtf_ma(_df):
                 if _df is None or len(_df) < 80:
-                    return False
+                    return None
                 _close = _df["close"]
                 _ma50 = _close.rolling(50).mean()
                 _ma200 = _close.rolling(200).mean()
-                return bool(
-                    pd.notna(_ma50.iloc[-1])
-                    and pd.notna(_ma200.iloc[-1])
-                    and float(_ma50.iloc[-1]) > float(_ma200.iloc[-1])
-                    and float(_close.iloc[-1]) > float(_ma50.iloc[-1])
-                )
+                if pd.isna(_ma50.iloc[-1]) or pd.isna(_ma200.iloc[-1]):
+                    return None
+                return float(_close.iloc[-1]), float(_ma50.iloc[-1]), float(_ma200.iloc[-1])
+
+            def _mtf_ok(_df):
+                x = _mtf_ma(_df)
+                if x is None:
+                    return False
+                _c, _ma50, _ma200 = x
+                return bool(_ma50 > _ma200 and _c > _ma50)
 
             mtf_trend_ok = _mtf_ok(df_mtf) and _mtf_ok(df_mtf_2)
+
+            # Regime: downtrend block (use 4h df by default: MTF_TREND_INTERVAL_2)
+            downtrend_block = False
+            _ma_info = _mtf_ma(df_mtf_2)
+            if _ma_info is not None:
+                _, ma50_4h, ma200_4h = _ma_info
+                downtrend_block = (ma50_4h < ma200_4h)
 
             # Phase A: minute consensus + hour MTF score (optional)
             minute_consensus = True
@@ -760,6 +778,33 @@ def run():
                         mtf_stage = "scout"
                         score_based_buy_krw = max(min_buy_krw, float(equity) * float(mtf_stage_pcts.get("scout", 0.01)))
                         buy_reasons.append(f"hour_mtf_score_low_allow_scout({hour_mtf_score})")
+
+                    # Regime filter: block buys in downtrend (4h MA50 < MA200)
+                    if downtrend_block_enabled and downtrend_block:
+                        should_buy = False
+                        buy_reasons.append("downtrend_block(ma50<ma200@4h)")
+
+                    # Pullback filter: in uptrend only, require fib retracement zone for entries
+                    if should_buy and fib_pullback_enabled and (not downtrend_block):
+                        try:
+                            if fib_lookback > 0 and len(df) > fib_lookback:
+                                win = df.tail(fib_lookback)
+                            else:
+                                win = df
+                            swing_high = float(win["high"].max())
+                            swing_low = float(win["low"].min())
+                            rng = max(1e-9, swing_high - swing_low)
+                            zone_high = swing_high - (rng * float(fib_min))
+                            zone_low = swing_high - (rng * float(fib_max))
+                            in_zone = (current_price >= zone_low) and (current_price <= zone_high)
+                            if not in_zone:
+                                should_buy = False
+                                buy_reasons.append(f"fib_pullback_block({fib_min:.3f}-{fib_max:.3f})")
+                            else:
+                                buy_reasons.append(f"fib_pullback_ok({fib_min:.3f}-{fib_max:.3f})")
+                        except Exception as e:
+                            logging.warning("fib pullback calc failed: %s", e)
+
                     if mtf_stage is not None:
                         buy_reasons.append(f"mtf_stage({mtf_stage})")
 
