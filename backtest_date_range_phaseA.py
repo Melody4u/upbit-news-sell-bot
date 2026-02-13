@@ -148,11 +148,15 @@ def simulate(
     cost_bps: float = 10.0,
     weights: Optional[Dict[str, int]] = None,
     wallst_v1: bool = True,
+    wallst_soft: bool = True,
     highwr_v1: bool = True,
+    scout_min_score: int = 20,
+    pos_min_frac: float = 0.15,
+    pos_max_frac: float = 1.0,
     fib_lookback: int = 120,
     fib_min: float = 0.382,
     fib_max: float = 0.618,
-    fib_swing_confirm: bool = True,
+    fib_swing_confirm: bool = False,
     d1_slope_lookback: int = 5,
     tp1_r: float = 0.8,
     tp2_r: float = 1.6,
@@ -196,6 +200,7 @@ def simulate(
     tp1 = tp2 = 0.0
     partial_done = False
     early_cut_done = False
+    pos_frac = 1.0
     trades = []
 
     for i in range(220, len(df)):
@@ -207,17 +212,28 @@ def simulate(
             continue
 
         if not in_pos:
-            # Phase A-ish: require some MTF score (>= scout_min default 30)
+            # Phase A-ish: require some MTF score (>= scout_min)
             s = score_mtf(ts, df_by_itv, weights)
-            if s < 30:
+            if s < int(scout_min_score):
                 continue
 
-            if wallst_v1:
-                # 1) D1 regime filter
-                if not d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback):
-                    continue
+            # position fraction (score-based sizing proxy)
+            s_clamped = max(int(scout_min_score), min(100, int(s)))
+            if 100 == int(scout_min_score):
+                pos_frac = float(pos_min_frac)
+            else:
+                pos_frac = float(pos_min_frac) + (float(pos_max_frac) - float(pos_min_frac)) * (
+                    (float(s_clamped) - float(scout_min_score)) / max(1.0, (100.0 - float(scout_min_score)))
+                )
 
-                # 2) Fib pullback zone of recent swing (on decision TF window)
+            if wallst_v1:
+                # 1) D1 regime filter (hard by default; soft mode will downsize instead)
+                if not d1_regime_ok(dfd, ts, slope_lookback=d1_slope_lookback):
+                    if not wallst_soft:
+                        continue
+                    pos_frac *= 0.4
+
+                # 2) Fib pullback zone (soft by default to keep trade frequency)
                 lb = int(max(50, fib_lookback))
                 win = df.iloc[max(0, i - lb + 1): i + 1]
                 if win.empty:
@@ -226,7 +242,9 @@ def simulate(
                     hi_i = int(win["high"].values.argmax())
                     lo_i = int(win["low"].values.argmin())
                     if not (lo_i < hi_i):
-                        continue
+                        if not wallst_soft:
+                            continue
+                        pos_frac *= 0.5
 
                 swing_high = float(win["high"].max())
                 swing_low = float(win["low"].min())
@@ -235,17 +253,25 @@ def simulate(
                 zone_low = swing_high - (rng * float(fib_max))
                 in_zone = (float(row["close"]) >= zone_low) and (float(row["close"]) <= zone_high)
                 if not in_zone:
-                    continue
+                    if not wallst_soft:
+                        continue
+                    pos_frac *= 0.7
 
-                # 3) Rebound confirmation: close crosses above EMA20
+                # 3) Rebound confirmation: close crosses above EMA20 (soft by default)
                 ema_now = float(row["ema20"]) if pd.notna(row["ema20"]) else 0.0
                 ema_prev = float(prev["ema20"]) if pd.notna(prev["ema20"]) else 0.0
-                if not (ema_now > 0 and ema_prev > 0 and float(row["close"]) > ema_now and float(prev["close"]) <= ema_prev):
-                    continue
+                rebound_ok = (ema_now > 0 and ema_prev > 0 and float(row["close"]) > ema_now and float(prev["close"]) <= ema_prev)
+                if not rebound_ok:
+                    if not wallst_soft:
+                        continue
+                    pos_frac *= 0.6
+
+                pos_frac = max(0.05, min(1.0, float(pos_frac)))
             else:
                 # Simple breakout trigger to approximate entry (close>prev high)
                 if float(row["close"]) <= float(prev["high"]):
                     continue
+                pos_frac = max(0.05, min(1.0, float(pos_frac)))
 
             entry = float(row["close"])
             stop = entry - atr
@@ -300,7 +326,7 @@ def simulate(
                                 gross_r_cut = (cut_price - entry) / risk_unit
                                 cost_leg = (cost_bps / 10000.0) * 2.0
                                 net_r_cut = gross_r_cut - (cost_leg / max(1e-9, risk_unit / entry))
-                                trades.append({"result": "loss", "r": float(net_r_cut) * float(ratio), "leg": f"early_cut_{lvl:.2f}R"})
+                                trades.append({"result": "loss", "r": float(net_r_cut) * float(ratio) * float(pos_frac), "leg": f"early_cut_{lvl:.2f}R"})
                                 early_cut_done = True
                                 break
 
@@ -311,7 +337,7 @@ def simulate(
                     # cost for this leg (entry+partial exit). assume round trip on that fraction
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
-                    trades.append({"result": "win", "r": float(net_r1) * float(tp1_ratio), "leg": "tp1"})
+                    trades.append({"result": "win", "r": float(net_r1) * float(tp1_ratio) * float(pos_frac), "leg": "tp1"})
                     partial_done = True
                     # move stop (context-aware): protect in weak trend, preserve right-tail in strong trend
                     mode_be = str(be_move_mode or "hybrid").lower()
@@ -354,7 +380,7 @@ def simulate(
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
                     remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
-                    trades.append({"result": result, "r": float(net_r) * float(remain_ratio), "leg": "rem"})
+                    trades.append({"result": result, "r": float(net_r) * float(remain_ratio) * float(pos_frac), "leg": "rem"})
                     in_pos = False
 
             else:
@@ -378,6 +404,8 @@ def simulate(
                     in_pos = False
 
     total = len(trades)
+    days = max(1.0, float((end - start).days))
+    trades_per_month = total / (days / 30.0)
     wins = sum(1 for t in trades if t["result"] == "win")
     losses = total - wins
     win_rate = (wins / total * 100.0) if total else 0.0
@@ -392,8 +420,12 @@ def simulate(
         "start": str(start.date()),
         "end": str((end - pd.Timedelta(days=0)).date()),
         "wallst_v1": bool(wallst_v1),
+        "wallst_soft": bool(wallst_soft),
         "highwr_v1": bool(highwr_v1),
+        "scout_min_score": int(scout_min_score),
+        "pos_frac": {"min": float(pos_min_frac), "max": float(pos_max_frac)},
         "trades": total,
+        "trades_per_month": round(float(trades_per_month), 2),
         "wins": wins,
         "losses": losses,
         "win_rate_pct": round(win_rate, 2),
@@ -425,12 +457,17 @@ def main():
     ap.add_argument("--min-rr", type=float, default=3.0)
     ap.add_argument("--cost-bps", type=float, default=10.0)
     ap.add_argument("--wallst-v1", action="store_true", help="Enable Wall St v1 entry: D1 regime + fib pullback + EMA20 rebound")
+    ap.add_argument("--wallst-soft", action="store_true", help="Soft gates for fib/rebound to keep trade frequency")
     ap.add_argument("--highwr-v1", action="store_true", help="Enable high win-rate v1 exits: TP1 partial + BE + TP2")
+    ap.add_argument("--scout-min-score", type=int, default=20)
+    ap.add_argument("--pos-min-frac", type=float, default=0.15)
+    ap.add_argument("--pos-max-frac", type=float, default=1.0)
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
     ap.add_argument("--fib-swing-confirm", action="store_true", help="Require swing confirmation (low before high) in fib window")
     ap.add_argument("--no-fib-swing-confirm", action="store_true", help="Disable fib swing confirmation")
+    ap.set_defaults(fib_swing_confirm=False)
     ap.add_argument("--d1-slope-lookback", type=int, default=5)
     ap.add_argument("--tp1-r", type=float, default=0.8)
     ap.add_argument("--tp2-r", type=float, default=1.6)
@@ -457,11 +494,15 @@ def main():
         min_rr=args.min_rr,
         cost_bps=args.cost_bps,
         wallst_v1=bool(args.wallst_v1),
+        wallst_soft=bool(args.wallst_soft),
         highwr_v1=bool(args.highwr_v1),
+        scout_min_score=int(args.scout_min_score),
+        pos_min_frac=float(args.pos_min_frac),
+        pos_max_frac=float(args.pos_max_frac),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
-        fib_swing_confirm=(False if bool(args.no_fib_swing_confirm) else (True if bool(args.fib_swing_confirm) else True)),
+        fib_swing_confirm=(False if bool(args.no_fib_swing_confirm) else (True if bool(args.fib_swing_confirm) else False)),
         d1_slope_lookback=int(args.d1_slope_lookback),
         tp1_r=float(args.tp1_r),
         tp2_r=float(args.tp2_r),
