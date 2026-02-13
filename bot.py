@@ -765,6 +765,8 @@ def run():
 
             should_sell = signal_score >= active_signal_threshold and coin_balance > 0
             should_buy = buy_score >= active_buy_threshold and krw_balance >= min_buy_krw
+            raw_should_buy = bool(should_buy)
+            raw_buy_reasons = list(buy_reasons)
 
             # Phase A gate: 3m/5m/15m AND consensus + hour score stage
             if enable_mtf_score_sizing:
@@ -964,6 +966,25 @@ def run():
                     })
                     last_block_hash = block_hash
                     last_block_ts = time.time()
+
+            # Candidate logging (debug/analysis): raw vs final buy decision
+            candidate_log_enabled = env_bool("CANDIDATE_LOG_ENABLED", True)
+            if candidate_log_enabled:
+                # log only when there is any buy signal strength or a buy was considered
+                if buy_score > 0 or raw_should_buy or intended_buy:
+                    append_trade_log(trade_log_path, {
+                        "ts": int(time.time()),
+                        "side": "buy_candidate",
+                        "market": market,
+                        "price": current_price,
+                        "buy_score": int(buy_score),
+                        "buy_threshold": int(active_buy_threshold),
+                        "raw_should_buy": bool(raw_should_buy),
+                        "final_should_buy": bool(should_buy),
+                        "raw_reasons": raw_buy_reasons,
+                        "final_reasons": buy_reasons,
+                        "dry_run": dry_run,
+                    })
 
             logging.info(
                 "tick | mode=%s risk=%.1f(%s) mtf=%s rr=%.2f atr=%.2f%% spread=%.1fbps price=%.0f coin=%.0fKRW krw=%.0f sell=%s/%s buy=%s/%s breakout=%s boxBreak=%s ma20=%.0f ma200=%.0f vwma100=%.0f gap=%.2f%% adx=%.1f rsi=%.1f news=%s",
