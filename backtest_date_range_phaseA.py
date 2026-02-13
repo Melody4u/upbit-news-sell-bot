@@ -235,11 +235,20 @@ def simulate(
     gate_hold = 0
     addon_counts = {"l1": 0, "l2": 0, "l3": 0}
 
+    entries = 0
+    legs_count = 0
+    r_pos_sum = 0.0
+    r_pos_count = 0
+
     equity = 1.0
     equity_peak = 1.0
     mdd_pct = 0.0
 
-    trades = []
+    # per-position accumulators
+    r_total_pos = 0.0
+
+    legs = []  # execution legs: early_cut/tp1/rem
+    positions = []  # per-entry totals
 
     for i in range(220, len(df)):
         ts = df.index[i]
@@ -376,9 +385,11 @@ def simulate(
             partial_done = False
             early_cut_done = False
             in_pos = True
+            entries += 1
             addon_count = 0
             last_addon_i = i
             gate_hold = 0
+            r_total_pos = 0.0
             entry_ctx_counts[entry_ctx] = int(entry_ctx_counts.get(entry_ctx, 0)) + 1
         else:
             low = float(row["low"])
@@ -491,10 +502,9 @@ def simulate(
                                 cost_leg = (cost_bps / 10000.0) * 2.0
                                 net_r_cut = gross_r_cut - (cost_leg / max(1e-9, risk_unit / entry))
                                 r_leg = float(net_r_cut) * float(ratio) * float(pos_frac)
-                                trades.append({"result": "loss", "r": r_leg, "leg": f"early_cut_{lvl:.2f}R"})
-                                equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
-                                equity_peak = max(equity_peak, equity)
-                                mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
+                                legs.append({"result": "loss", "r": r_leg, "leg": f"early_cut_{lvl:.2f}R"})
+                                legs_count += 1
+                                r_total_pos += float(r_leg)
                                 early_cut_done = True
                                 break
 
@@ -506,10 +516,9 @@ def simulate(
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
                     r_leg = float(net_r1) * float(tp1_ratio) * float(pos_frac)
-                    trades.append({"result": "win", "r": r_leg, "leg": "tp1"})
-                    equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
-                    equity_peak = max(equity_peak, equity)
-                    mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
+                    legs.append({"result": "win", "r": r_leg, "leg": "tp1"})
+                    legs_count += 1
+                    r_total_pos += float(r_leg)
                     partial_done = True
                     # move stop (context-aware): protect in weak trend, preserve right-tail in strong trend
                     mode_be = str(be_move_mode or "hybrid").lower()
@@ -553,10 +562,23 @@ def simulate(
                     net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
                     remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
                     r_leg = float(net_r) * float(remain_ratio) * float(pos_frac)
-                    trades.append({"result": result, "r": r_leg, "leg": "rem"})
-                    equity *= max(1e-9, (1.0 + (r_leg * float(risk_per_trade))))
+                    legs.append({"result": result, "r": r_leg, "leg": "rem"})
+                    legs_count += 1
+                    r_total_pos += float(r_leg)
+
+                    # Close position: apply equity update ONCE per position using aggregated R
+                    r_pos = float(r_total_pos)
+                    positions.append({"r": r_pos, "entry_ctx": entry_ctx, "addon_count": int(addon_count)})
+                    r_pos_sum += r_pos
+                    r_pos_count += 1
+
+                    equity *= max(1e-9, (1.0 + (r_pos * float(risk_per_trade))))
                     equity_peak = max(equity_peak, equity)
                     mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
+
+                    # reset per-position accumulators
+                    r_total_pos = 0.0
+
                     in_pos = False
 
             else:
@@ -576,20 +598,34 @@ def simulate(
                     cost = (cost_bps / 10000.0) * 2.0
                     gross_r = (exit_price - entry) / risk_unit
                     net_r = gross_r - (cost / max(1e-9, risk_unit / entry))
-                    trades.append({"result": result, "r": float(net_r)})
+                    # basic mode: one leg == one position close
+                    r_pos = float(net_r)
+                    legs.append({"result": result, "r": r_pos, "leg": "basic"})
+                    legs_count += 1
+                    positions.append({"r": r_pos, "entry_ctx": entry_ctx, "addon_count": int(addon_count)})
+                    r_pos_sum += r_pos
+                    r_pos_count += 1
+
+                    equity *= max(1e-9, (1.0 + (r_pos * float(risk_per_trade))))
+                    equity_peak = max(equity_peak, equity)
+                    mdd_pct = max(mdd_pct, (equity_peak - equity) / equity_peak)
                     in_pos = False
 
-    total = len(trades)
+    total_legs = int(legs_count)
+    total_entries = int(entries)
     days = max(1.0, float((end - start).days))
-    trades_per_month = total / (days / 30.0)
-    wins = sum(1 for t in trades if t["result"] == "win")
-    losses = total - wins
-    win_rate = (wins / total * 100.0) if total else 0.0
+    entries_per_month = total_entries / (days / 30.0)
+    legs_per_month = total_legs / (days / 30.0)
 
-    gross_win = sum(max(0.0, t["r"]) for t in trades)
-    gross_loss = abs(sum(min(0.0, t["r"]) for t in trades))
+    wins = sum(1 for t in legs if t["result"] == "win")
+    losses = total_legs - wins
+    win_rate = (wins / total_legs * 100.0) if total_legs else 0.0
+
+    gross_win = sum(max(0.0, t["r"]) for t in legs)
+    gross_loss = abs(sum(min(0.0, t["r"]) for t in legs))
     pf = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
-    avg_r = float(np.mean([t["r"] for t in trades])) if trades else 0.0
+    avg_r = float(np.mean([t["r"] for t in legs])) if legs else 0.0
+    avg_r_pos = (float(r_pos_sum) / float(r_pos_count)) if r_pos_count > 0 else 0.0
 
     mdd_ok = bool(float(mdd_pct) <= float(mdd_limit_pct))
 
@@ -621,13 +657,16 @@ def simulate(
         "return_pct": round((float(equity) - 1.0) * 100.0, 2),
         "mdd_pct": round(float(mdd_pct), 4),
         "mdd_ok": bool(mdd_ok),
-        "trades": total,
-        "trades_per_month": round(float(trades_per_month), 2),
+        "entries": total_entries,
+        "legs": total_legs,
+        "entries_per_month": round(float(entries_per_month), 2),
+        "legs_per_month": round(float(legs_per_month), 2),
         "wins": wins,
         "losses": losses,
         "win_rate_pct": round(win_rate, 2),
         "profit_factor": round(pf, 3),
         "avg_r": round(avg_r, 4),
+        "avg_r_pos": round(float(avg_r_pos), 4),
         "cost_bps": cost_bps,
         "min_rr": min_rr,
         "decision_tf": "minute60",
