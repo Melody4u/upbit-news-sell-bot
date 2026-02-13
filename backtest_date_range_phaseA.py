@@ -266,8 +266,9 @@ def simulate(
                 ema_now_ctx = float(row["ema20"]) if pd.notna(row["ema20"]) else 0.0
                 adx_now_ctx = float(row["adx"]) if pd.notna(row["adx"]) else 0.0
 
-                l1 = (int(s) >= int(good_gate_l1_score)) and bool(h4_ok) and bool(d1_ok)
-                l2 = l1 and (int(s) >= int(good_gate_l2_score)) and (adx_now_ctx >= float(adx_min)) and (ema_now_ctx > 0 and float(row["close"]) >= ema_now_ctx)
+                # relaxed definition: L1 doesn't require h4_ok (too idealistic/rare); L2 adds strength filters
+                l1 = (int(s) >= int(good_gate_l1_score)) and bool(d1_ok)
+                l2 = (int(s) >= int(good_gate_l2_score)) and bool(d1_ok) and (adx_now_ctx >= float(adx_min)) and (ema_now_ctx > 0 and float(row["close"]) >= ema_now_ctx)
 
                 if str(good_gate_mode).lower() == "l2" and (not l2):
                     continue
@@ -355,8 +356,8 @@ def simulate(
                     h4_ok_now = mtf_ok(sub240_now.tail(260)) if (sub240_now is not None and len(sub240_now) >= 220) else False
                     ema_now_ctx2 = float(row.get("ema20", 0.0) or 0.0)
                     adx_now_ctx2 = float(row.get("adx", 0.0) or 0.0)
-                    l1_now = (int(s_now) >= int(good_gate_l1_score)) and bool(h4_ok_now) and bool(d1_ok_now)
-                    l2_now = l1_now and (int(s_now) >= int(good_gate_l2_score)) and (adx_now_ctx2 >= float(adx_min)) and (ema_now_ctx2 > 0 and float(row["close"]) >= ema_now_ctx2)
+                    l1_now = (int(s_now) >= int(good_gate_l1_score)) and bool(d1_ok_now)
+                    l2_now = (int(s_now) >= int(good_gate_l2_score)) and bool(d1_ok_now) and (adx_now_ctx2 >= float(adx_min)) and (ema_now_ctx2 > 0 and float(row["close"]) >= ema_now_ctx2)
                     ctx_now = "l2" if l2_now else ("l1" if l1_now else "other")
 
                     if mode_gate in ("l1", "l2"):
