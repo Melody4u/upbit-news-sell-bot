@@ -368,6 +368,7 @@ def run():
     fib_lookback = get_env_int("FIB_LOOKBACK", 120)
     fib_min = get_env_float("FIB_MIN", 0.382)
     fib_max = get_env_float("FIB_MAX", 0.618)
+    fib_swing_confirm = env_bool("FIB_SWING_CONFIRM", True)
 
     # volatility spike block (Phase B-lite)
     vol_spike_block_enabled = env_bool("VOL_SPIKE_BLOCK_ENABLED", False)
@@ -381,6 +382,8 @@ def run():
     partial_tp_ratios = parse_float_list_csv(os.getenv("PARTIAL_TP_RATIOS", "0.6,0.4"), [0.6, 0.4])
     move_stop_to_be_after_tp1 = env_bool("MOVE_STOP_TO_BE_AFTER_TP1", True)
     be_offset_bps = get_env_float("BE_OFFSET_BPS", 8.0)
+    be_move_mode = os.getenv("BE_MOVE_MODE", "hybrid").lower()  # always|weak_only|hybrid
+    be_strong_stop_r = get_env_float("BE_STRONG_STOP_R", -0.2)  # in strong context, lift stop to entry + R* risk (negative = below entry)
 
     # Early fail cut (high win-rate / cut losers faster)
     early_fail_cut_enabled = env_bool("EARLY_FAIL_CUT_ENABLED", True)
@@ -851,6 +854,15 @@ def run():
                                 win = df.tail(fib_lookback)
                             else:
                                 win = df
+                            # swing confirmation: require that low occurs before high within window (up-move then pullback)
+                            if fib_swing_confirm:
+                                hi_i = int(win["high"].values.argmax())
+                                lo_i = int(win["low"].values.argmin())
+                                if not (lo_i < hi_i):
+                                    should_buy = False
+                                    buy_reasons.append("fib_swing_unconfirmed")
+                                    raise RuntimeError("fib swing unconfirmed")
+
                             swing_high = float(win["high"].max())
                             swing_low = float(win["low"].min())
                             rng = max(1e-9, swing_high - swing_low)
@@ -1193,11 +1205,32 @@ def run():
                                 runtime_state["trades_today"] = int(runtime_state.get("trades_today", 0)) + 1
                                 # Optional: after first partial TP, move stop to breakeven (+fees buffer)
                                 if move_stop_to_be_after_tp1 and len(partial_tp_done) == 1 and avg_buy_price > 0:
-                                    be_price = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
-                                    if last_buy_stop_price is None or be_price > float(last_buy_stop_price):
-                                        last_buy_stop_price = float(be_price)
-                                        # keep entry_stop_price unchanged; we want stable R basis
+                                    # Context-aware BE move: protect left-tail in weak trend, preserve right-tail in strong trend.
+                                    strong_ctx = (mtf_trend_ok is True) and (metrics.get("adx", 0) >= float(cfg["ADX_MIN"])) and (hour_mtf_score is not None and int(hour_mtf_score) >= int(mtf_stage_thresholds.get("medium", 65)))
+                                    weak_ctx = (not mtf_trend_ok) or downtrend_block or (metrics.get("adx", 0) < float(cfg["ADX_MIN"]))
+
+                                    target_stop = None
+                                    if be_move_mode == "always":
+                                        target_stop = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
                                         signal_reasons.append(f"be_stop_after_tp1({be_offset_bps:.1f}bps)")
+                                    elif be_move_mode == "weak_only":
+                                        if weak_ctx:
+                                            target_stop = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
+                                            signal_reasons.append(f"be_stop_after_tp1_weak({be_offset_bps:.1f}bps)")
+                                    else:  # hybrid default
+                                        if weak_ctx and (not strong_ctx):
+                                            target_stop = avg_buy_price * (1.0 + (be_offset_bps / 10000.0))
+                                            signal_reasons.append(f"be_stop_after_tp1_weak({be_offset_bps:.1f}bps)")
+                                        elif strong_ctx and entry_stop_price is not None and entry_stop_price < avg_buy_price:
+                                            # in strong trend, lift stop closer but keep some room to avoid chopping winners
+                                            risk0 = avg_buy_price - float(entry_stop_price)
+                                            target_stop = avg_buy_price + (risk0 * float(be_strong_stop_r))
+                                            signal_reasons.append(f"stop_lift_after_tp1_strong({be_strong_stop_r:.2f}R)")
+
+                                    if target_stop is not None:
+                                        if last_buy_stop_price is None or float(target_stop) > float(last_buy_stop_price):
+                                            last_buy_stop_price = float(target_stop)
+                                        # keep entry_stop_price unchanged; we want stable R basis
                                 partial_tp_executed = True
                         break
 
