@@ -190,6 +190,7 @@ def simulate(
     addon_stop_lift_r: float = -0.2,
     risk_per_trade: float = 0.015,
     mdd_limit_pct: float = 0.30,
+    downtrend_mode: str = "or",  # h4|d1|or|off
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
@@ -259,6 +260,34 @@ def simulate(
             continue
 
         if not in_pos:
+            # Downtrend gate (하락추세): block entries depending on mode
+            sub240_dt = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+            subd1_dt = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+
+            # H4 downtrend: MA50 < MA200 on H4
+            h4_down = False
+            if sub240_dt is not None and not sub240_dt.empty:
+                c = sub240_dt["close"]
+                ma50 = c.rolling(50).mean()
+                ma200 = c.rolling(200).mean()
+                if len(ma200) > 0 and pd.notna(ma50.iloc[-1]) and pd.notna(ma200.iloc[-1]):
+                    h4_down = bool(float(ma50.iloc[-1]) < float(ma200.iloc[-1]))
+
+            # D1 downtrend: EMA20 < EMA50 on D1
+            d1_down = False
+            if subd1_dt is not None and not subd1_dt.empty and "ema_fast" in subd1_dt.columns and "ema_slow" in subd1_dt.columns:
+                ef = float(subd1_dt["ema_fast"].iloc[-1]) if pd.notna(subd1_dt["ema_fast"].iloc[-1]) else 0.0
+                es = float(subd1_dt["ema_slow"].iloc[-1]) if pd.notna(subd1_dt["ema_slow"].iloc[-1]) else 0.0
+                if ef > 0 and es > 0:
+                    d1_down = bool(ef < es)
+
+            dm = str(downtrend_mode or "or").lower()
+            if dm not in ("h4", "d1", "or", "off"):
+                dm = "or"
+            downtrend = (h4_down or d1_down) if dm == "or" else (h4_down if dm == "h4" else (d1_down if dm == "d1" else False))
+            if downtrend:
+                continue
+
             # Phase A-ish: require some MTF score (>= scout_min)
             s = score_mtf(ts, df_by_itv, weights)
             if s < int(scout_min_score):
@@ -657,6 +686,7 @@ def simulate(
         "return_pct": round((float(equity) - 1.0) * 100.0, 2),
         "mdd_pct": round(float(mdd_pct), 4),
         "mdd_ok": bool(mdd_ok),
+        "downtrend_mode": str(downtrend_mode),
         "entries": total_entries,
         "legs": total_legs,
         "entries_per_month": round(float(entries_per_month), 2),
@@ -717,6 +747,7 @@ def main():
     ap.add_argument("--addon-stop-lift-r", type=float, default=-0.2)
     ap.add_argument("--risk-per-trade", type=float, default=0.015)
     ap.add_argument("--mdd-limit-pct", type=float, default=0.30)
+    ap.add_argument("--downtrend-mode", type=str, default="or", help="h4|d1|or|off")
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -772,6 +803,7 @@ def main():
         addon_stop_lift_r=float(args.addon_stop_lift_r),
         risk_per_trade=float(args.risk_per_trade),
         mdd_limit_pct=float(args.mdd_limit_pct),
+        downtrend_mode=str(args.downtrend_mode),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
