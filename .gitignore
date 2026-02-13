@@ -8,6 +8,8 @@ logs/*.jsonl
 logs/*.log
 logs/*.out.log
 logs/*.err.log
+logs/*.pid
+logs/*.heartbeat
 logs/runtime_state.json
 logs/market_risk.json
 logs/stop_alert_state.json
