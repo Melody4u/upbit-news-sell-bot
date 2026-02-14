@@ -166,6 +166,25 @@ def main():
     # next
     print("- Next: 시시퍼스 candidates.json 생성이 실제로 반영되는지(빈 파일 방지)부터 고정")
 
+    # Kiwi one-liner (action-needed / permission-needed)
+    need = []
+    # memory_search currently needs Gemini embeddings key
+    need.append("memory_search 복구용 Gemini API 키 발급(희찬) 대기")
+    # candidates file empty -> Sisyphus generation not yet wired
+    cand_path = DUMPROOT / "candidates.json"
+    try:
+        if cand_path.exists():
+            obj = json.loads(cand_path.read_text(encoding="utf-8"))
+            if not (obj.get("candidates") or []):
+                need.append("candidates.json이 비어있음 → 시시퍼스 후보 생성 연결 필요")
+    except Exception:
+        need.append("candidates.json 파싱 실패")
+
+    if need:
+        print(f"- Kiwi 한줄평: {need[0]}")
+    else:
+        print("- Kiwi 한줄평: 오늘은 자동으로 굴러가고 있음 — 남은 건 ‘채택 1회’만 만들면 됨")
+
 
 if __name__ == "__main__":
     main()
