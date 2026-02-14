@@ -60,16 +60,42 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
   $p = Start-Process -FilePath $py -ArgumentList $args -WorkingDirectory $root -RedirectStandardOutput $outPath -RedirectStandardError $errPath -NoNewWindow -PassThru
   $p.WaitForExit()
 
-  # Normalize encoding: Start-Process redirection can produce UTF-16; convert logs to UTF-8 for tooling.
+  # Normalize encoding: Start-Process redirection often produces UTF-16LE, but not always.
+  # If we blindly read as Unicode we can corrupt already-UTF8 logs (mojibake). Detect first, then convert to UTF-8.
+  function Normalize-LogToUtf8([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    if ($bytes.Length -eq 0) { return }
+
+    $enc = $null
+
+    # BOM checks
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+      $enc = [System.Text.Encoding]::Unicode # UTF-16LE
+    } elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+      $enc = [System.Text.Encoding]::BigEndianUnicode # UTF-16BE
+    } elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+      $enc = [System.Text.Encoding]::UTF8
+    } else {
+      # Heuristic: lots of NULs in the first chunk => UTF-16LE from redirection.
+      $chunkLen = [Math]::Min(256, $bytes.Length)
+      $nulCount = 0
+      for ($i = 0; $i -lt $chunkLen; $i++) { if ($bytes[$i] -eq 0) { $nulCount++ } }
+      if ($nulCount -ge 8) {
+        $enc = [System.Text.Encoding]::Unicode
+      } else {
+        $enc = [System.Text.Encoding]::UTF8
+      }
+    }
+
+    $text = $enc.GetString($bytes)
+    [System.IO.File]::WriteAllText($path, $text, [System.Text.Encoding]::UTF8)
+  }
+
   try {
-    if (Test-Path -LiteralPath $outPath) {
-      $txt = Get-Content -LiteralPath $outPath -Raw -Encoding Unicode
-      Set-Content -LiteralPath $outPath -Value $txt -Encoding utf8
-    }
-    if (Test-Path -LiteralPath $errPath) {
-      $txte = Get-Content -LiteralPath $errPath -Raw -Encoding Unicode
-      Set-Content -LiteralPath $errPath -Value $txte -Encoding utf8
-    }
+    Normalize-LogToUtf8 $outPath
+    Normalize-LogToUtf8 $errPath
   } catch {
     # ignore; keep original files
   }
