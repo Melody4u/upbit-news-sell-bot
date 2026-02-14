@@ -201,7 +201,7 @@ def simulate(
     box_mode: str = "off",  # off|d1_adx
     box_d1_adx_max: float = 20.0,
     box_breakout_momo_atr: float = 0.0,  # 0 disables; allow entry in box only when breakout+momo
-    box_breakout_tf: str = "d3",  # d3|w1|h1
+    box_breakout_tf: str = "d3",  # d1|d3|w1|h1
     box_breakout_lookback: int = 10,
     box_breakout_confirm: int = 2,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
@@ -415,6 +415,10 @@ def simulate(
                     level = None
                     if tf == "w1":
                         sub = dfw[dfw.index <= ts] if isinstance(dfw.index, pd.DatetimeIndex) else pd.DataFrame()
+                        if sub is not None and len(sub) >= lookback:
+                            level = float(sub["high"].iloc[-lookback:].max())
+                    elif tf == "d1":
+                        sub = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
                         if sub is not None and len(sub) >= lookback:
                             level = float(sub["high"].iloc[-lookback:].max())
                     elif tf == "h1":
@@ -1071,7 +1075,7 @@ def main():
     ap.add_argument("--box-mode", type=str, default="off", help="off|d1_adx")
     ap.add_argument("--box-d1-adx-max", type=float, default=20.0)
     ap.add_argument("--box-breakout-momo-atr", type=float, default=0.0, help="Allow entry inside box only when breakout+momo; candle body >= M*ATR")
-    ap.add_argument("--box-breakout-tf", type=str, default="d3", help="Breakout TF for box override: d3|w1|h1")
+    ap.add_argument("--box-breakout-tf", type=str, default="d3", help="Breakout TF for box override: d1|d3|w1|h1")
     ap.add_argument("--box-breakout-lookback", type=int, default=10, help="Lookback candles on breakout TF")
     ap.add_argument("--box-breakout-confirm", type=int, default=2, help="Require N H1 closes above breakout level")
     ap.add_argument("--addon-min-bars", type=int, default=1)
