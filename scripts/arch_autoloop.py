@@ -153,13 +153,96 @@ def score_run(h2: dict, q4: dict) -> float:
     return float(score)
 
 
-def accept_patch(base_h2: dict, base_q4: dict, new_h2: dict, new_q4: dict) -> bool:
-    # Accept if score improves and Q4 doesn't catastrophically regress.
+def step_ladder_defs() -> list[dict]:
+    # Small steps first: we want ACCEPTs to happen so improvements can accumulate.
+    # Later steps converge to original ladder goals.
+    return [
+        {
+            "name": "S0-safety",
+            "desc": "Q4 급격한 악화 금지(안전) — 변화 누적 가능",
+        },
+        {
+            "name": "S1-rem_any",
+            "desc": "H2 rem 손실이 조금이라도 개선(>= +1R) 또는 H2 MDD -0.005 개선",
+        },
+        {
+            "name": "S2-rem_real",
+            "desc": "H2 rem 손실 의미있게 개선(>= +5R) 또는 H2 MDD -0.02 개선",
+        },
+        {
+            "name": "S3-score",
+            "desc": "H2(return↑/MDD↓) 종합점수 개선(>+1) + Q4 방어",
+        },
+        {
+            "name": "S4-ladder",
+            "desc": "A(H2) PASS & B(Q4) PASS (원래 라더 목표)",
+        },
+    ]
+
+
+def _q4_safe(base_q4: dict, new_q4: dict) -> bool:
+    # Safety guardrail: don't let Q4 deteriorate too much.
+    base_r = float(base_q4.get("return_pct", 0.0) or 0.0)
+    new_r = float(new_q4.get("return_pct", 0.0) or 0.0)
+    base_mdd = float(base_q4.get("mdd_pct", 0.0) or 0.0)
+    new_mdd = float(new_q4.get("mdd_pct", 0.0) or 0.0)
+    return bool((base_r - new_r) <= 3.0 and (new_mdd - base_mdd) <= 0.02)
+
+
+def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
+    """Return (best_step, reason).
+
+    Steps are cumulative; we check upward from current_step.
+    """
+    defs = step_ladder_defs()
+    base_h2, base_q4 = base["H2"]["res"], base["Q4"]["res"]
+    new_h2, new_q4 = new["H2"]["res"], new["Q4"]["res"]
+    base_h2s, new_h2s = base["H2"]["summ"], new["H2"]["summ"]
+
+    if not _q4_safe(base_q4, new_q4):
+        return current_step, "Q4 safety fail"
+
+    # Step4: original ladder goals
+    a_pass = bool(float(new_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(new_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30)
+    b_pass = bool(float(new_q4.get("return_pct", 0.0) or 0.0) >= 0.0)
+
+    # Rem improvement proxies (R deltas)
+    base_rem = float(base_h2s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
+    new_rem = float(new_h2s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
+    rem_improve = new_rem - base_rem  # less negative => positive improve
+
+    base_mdd = float(base_h2.get("mdd_pct", 0.0) or 0.0)
+    new_mdd = float(new_h2.get("mdd_pct", 0.0) or 0.0)
+    mdd_improve = base_mdd - new_mdd
+
     base_score = score_run(base_h2, base_q4)
     new_score = score_run(new_h2, new_q4)
 
-    q4_r_drop = float(base_q4.get("return_pct", 0.0) or 0.0) - float(new_q4.get("return_pct", 0.0) or 0.0)
-    return bool((new_score > base_score + 1.0) and q4_r_drop <= 3.0)
+    best = current_step
+    reason = ""
+
+    # S0 is safety gate (already passed if we got here)
+    if current_step <= 0:
+        best = max(best, 0)
+        reason = "S0 safety"
+
+    if rem_improve >= 1.0 or mdd_improve >= 0.005:
+        best = max(best, 1)
+        reason = f"S1 rem_improve={rem_improve:.2f}R mdd_improve={mdd_improve:.3f}"
+
+    if rem_improve >= 5.0 or mdd_improve >= 0.02:
+        best = max(best, 2)
+        reason = f"S2 rem_improve={rem_improve:.2f}R mdd_improve={mdd_improve:.3f}"
+
+    if new_score > base_score + 1.0:
+        best = max(best, 3)
+        reason = f"S3 score {base_score:.2f}->{new_score:.2f}"
+
+    if a_pass and b_pass:
+        best = max(best, 4)
+        reason = "S4 ladder pass"
+
+    return best, reason
 
 
 def load_state() -> dict:
@@ -195,6 +278,7 @@ def main():
 
     state = load_state()
     tried = set(state.get("tried_labels", []) or [])
+    current_step = int(state.get("accept_step", 0) or 0)
 
     # 1) baseline ladder
     base = {}
@@ -270,6 +354,8 @@ def main():
 
     best = None
     best_label = ""
+    best_reason = ""
+    best_step = current_step
     best_score = score_run(base_h2, base_q4)
 
     max_cands = int(max(0, args.max_candidates))
@@ -295,10 +381,14 @@ def main():
         new_score = score_run(new["H2"]["res"], new["Q4"]["res"])
         tried.add(label)
 
-        if accept_patch(base_h2, base_q4, new["H2"]["res"], new["Q4"]["res"]):
-            if new_score > best_score:
+        step_hit, reason = achieved_step(base, new, current_step)
+        if step_hit > current_step:
+            # Prefer bigger step jumps; tie-break by score
+            if (step_hit > best_step) or (step_hit == best_step and new_score > best_score):
                 best = new
                 best_label = label
+                best_reason = reason
+                best_step = step_hit
                 best_score = new_score
 
         save_preset(preset0)
@@ -307,6 +397,7 @@ def main():
         if runs_patch >= int(max(0, args.max_candidates)):
             break
 
+    step_jump = 0
     if best is not None:
         applied = True
         for cand in candidates:
@@ -321,19 +412,30 @@ def main():
         base_h2_s = base["H2"]["summ"]
         ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
         ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
-        action = f"ACCEPT: {best_label}"
+        step_jump = int(best_step) - int(current_step)
+        action = f"ACCEPT(S{current_step}->S{best_step}, +{step_jump}): {best_label}"
 
     # 3) persist state + commit accepted preset
     state["tried_labels"] = sorted(list(tried))[-400:]
     state["last_focus"] = focus
     state["last_evidence"] = str(EVIDENCE)
+    if applied:
+        state["accept_step"] = int(best_step)
+        state["last_accept"] = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "from": int(current_step),
+            "to": int(best_step),
+            "jump": int(step_jump),
+            "label": best_label,
+            "reason": best_reason,
+        }
     save_state(state)
 
     if applied:
         msg = (
-            f"auto: {best_label} | "
-            f"H2 return {base['H2']['res'].get('return_pct')} / mdd {base['H2']['res'].get('mdd_pct')} | "
-            f"Q4 return {base['Q4']['res'].get('return_pct')} / mdd {base['Q4']['res'].get('mdd_pct')}"
+            f"auto[S{current_step}->S{best_step}]: {best_label} | {best_reason} | "
+            f"H2 {base['H2']['res'].get('return_pct')} mdd {base['H2']['res'].get('mdd_pct')} | "
+            f"Q4 {base['Q4']['res'].get('return_pct')} mdd {base['Q4']['res'].get('mdd_pct')}"
         )
         git(["add", str(PRESET), str(STATE)])
         git(["commit", "-m", msg])
@@ -346,6 +448,7 @@ def main():
 
     print(f"[arch-loop] {datetime.now().strftime('%Y-%m-%d %H:00')}")
     print(f"- Focus(원인): {focus}")
+    print(f"- Step: S{current_step}" + (f" -> S{best_step}(+{step_jump})" if applied else ""))
     print(f"- Ladder: A(H2)={ladder_a}, B(Q4)={ladder_b}, C(Long)=SKIP")
     print(f"- Action(이번): {action}")
     print(f"- Result(전/후): 관측 기반" if (not applied) else "- Result(전/후): 개선 적용")
