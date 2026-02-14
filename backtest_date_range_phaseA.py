@@ -853,7 +853,7 @@ def main():
     ap.add_argument("--vol-spike-block", action="store_true", help="Block entries after extreme range bar")
     ap.add_argument("--vol-spike-atr-mult", type=float, default=2.5)
     ap.add_argument("--vol-spike-hold-bars", type=int, default=2)
-    ap.add_argument("--disable-addon-in-downtrend", action="store_true")
+    ap.add_argument("--disable-addon-in-downtrend", action="store_true", help="Disable pyramiding add-ons when downtrend filter is active")
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -917,7 +917,7 @@ def main():
         vol_spike_block_enabled=bool(args.vol_spike_block),
         vol_spike_block_atr_mult=float(args.vol_spike_atr_mult),
         vol_spike_block_hold_bars=int(args.vol_spike_hold_bars),
-        disable_addon_in_downtrend=bool(args.disable_addon_in_downtrend),
+        disable_addon_in_downtrend=bool(getattr(args, "disable_addon_in_downtrend", False)), 
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),

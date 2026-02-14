@@ -35,6 +35,12 @@ def parse_out(path: pathlib.Path):
 
 
 def main():
+    # Ensure Windows console can print UTF-8 (avoid cp949 UnicodeEncodeError)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     pattern = sys.argv[1] if len(sys.argv) > 1 else "research_KRW-BTC_"
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 
