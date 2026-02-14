@@ -197,7 +197,7 @@ def simulate(
     riskoff_action: str = "block_new",  # block_new|cap_only
     uptrend_only: bool = False,
     uptrend_w1_filter: str = "off",  # off|close_above_ma200
-    uptrend_m1_filter: str = "off",  # off|close_above_ma20
+    uptrend_m1_filter: str = "off",  # off|close_above_ma6|close_above_ma12|close_above_ma20
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -410,15 +410,17 @@ def simulate(
                         uptrend_nan_count += 1
                         w1_ok = False
 
-                # Optional M1 filter: close above MA20 on M1 (MA200 is too long for available history)
+                # Optional M1 filter: close above MA{6|12|20} on M1 (MA200 is too long for available history)
                 m1_ok = True
-                if str(uptrend_m1_filter or "off").lower() == "close_above_ma20":
+                m1_mode = str(uptrend_m1_filter or "off").lower()
+                if m1_mode in ("close_above_ma6", "close_above_ma12", "close_above_ma20"):
+                    period = 20 if m1_mode.endswith("ma20") else (12 if m1_mode.endswith("ma12") else 6)
                     subm = dfm[dfm.index <= ts] if isinstance(dfm.index, pd.DatetimeIndex) else pd.DataFrame()
                     if subm is not None and not subm.empty and "close" in subm.columns:
                         cm = subm["close"].astype(float)
-                        ma20m = cm.rolling(20).mean()
-                        if len(ma20m) > 0 and pd.notna(ma20m.iloc[-1]) and pd.notna(cm.iloc[-1]):
-                            m1_ok = bool(float(cm.iloc[-1]) > float(ma20m.iloc[-1]))
+                        mam = cm.rolling(int(period)).mean()
+                        if len(mam) > 0 and pd.notna(mam.iloc[-1]) and pd.notna(cm.iloc[-1]):
+                            m1_ok = bool(float(cm.iloc[-1]) > float(mam.iloc[-1]))
                         else:
                             uptrend_nan_count += 1
                             m1_ok = False
@@ -983,7 +985,7 @@ def main():
     ap.add_argument("--riskoff-action", type=str, default="block_new", help="block_new|cap_only")
     ap.add_argument("--uptrend-only", action="store_true", help="Allow NEW entries only when uptrend conditions hold")
     ap.add_argument("--uptrend-w1-filter", type=str, default="off", help="off|close_above_ma200")
-    ap.add_argument("--uptrend-m1-filter", type=str, default="off", help="off|close_above_ma20")
+    ap.add_argument("--uptrend-m1-filter", type=str, default="off", help="off|close_above_ma6|close_above_ma12|close_above_ma20")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
