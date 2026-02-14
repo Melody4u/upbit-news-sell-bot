@@ -200,6 +200,7 @@ def simulate(
     uptrend_m1_filter: str = "off",  # off|close_above_ma6|close_above_ma12|close_above_ma20
     box_mode: str = "off",  # off|d1_adx
     box_d1_adx_max: float = 20.0,
+    box_breakout_momo_atr: float = 0.0,  # 0 disables; allow entry in box only when breakout+momo
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -277,6 +278,8 @@ def simulate(
     uptrend_true_count = 0
     uptrend_nan_count = 0
     box_true_count = 0
+    box_breakout_allowed_count = 0
+    box_breakout_blocked_count = 0
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
@@ -312,6 +315,7 @@ def simulate(
         close = float(row["close"])
         high = float(row["high"])
         low = float(row["low"])
+        open_p = float(row["open"]) if ("open" in row) else float(prev["close"])
 
         if not in_pos:
             # Downtrend gate (하락추세): block entries depending on mode
@@ -380,15 +384,34 @@ def simulate(
             if riskoff and str(riskoff_action or "block_new").lower() == "block_new":
                 continue
 
-            # Box(횡보) filter: if box, block new entries (position management still runs elsewhere)
+            # Box(횡보) filter: normally block new entries; optionally allow only breakout+momo entries
             box = False
             if str(box_mode or "off").lower() == "d1_adx":
                 if subd1_dt is not None and not subd1_dt.empty and "adx" in subd1_dt.columns:
                     a = float(subd1_dt["adx"].iloc[-1]) if pd.notna(subd1_dt["adx"].iloc[-1]) else 0.0
                     box = bool(a > 0 and a < float(box_d1_adx_max))
+
             if box:
                 box_true_count += 1
-                continue
+                # Breakout+momo override (minimal knobs):
+                # - breakout: close > recent high (lookback fixed)
+                # - momo: candle body >= M*ATR
+                if float(box_breakout_momo_atr) > 0:
+                    lookback = 48  # fixed: last 48x 60m bars (~2 days)
+                    if i >= lookback:
+                        recent_high = float(df["high"].iloc[i - lookback : i].max())
+                        body = float(close - open_p)
+                        if float(close) > recent_high and body >= float(box_breakout_momo_atr) * float(atr):
+                            box_breakout_allowed_count += 1
+                        else:
+                            box_breakout_blocked_count += 1
+                            continue
+                    else:
+                        box_breakout_blocked_count += 1
+                        continue
+                else:
+                    box_breakout_blocked_count += 1
+                    continue
 
             # Uptrend-only mode (A): allow NEW entries only when uptrend AND conditions hold
             uptrend = False
@@ -935,7 +958,10 @@ def simulate(
             "uptrend_m1_filter": str(uptrend_m1_filter),
             "box_mode": str(box_mode),
             "box_d1_adx_max": float(box_d1_adx_max),
+            "box_breakout_momo_atr": float(box_breakout_momo_atr),
             "box_true_count": int(box_true_count),
+            "box_breakout_allowed_count": int(box_breakout_allowed_count),
+            "box_breakout_blocked_count": int(box_breakout_blocked_count),
             "uptrend_true_count": int(uptrend_true_count),
             "uptrend_nan_count": int(uptrend_nan_count),
             "riskoff_true_count": int(riskoff_true_count),
@@ -1004,6 +1030,7 @@ def main():
     ap.add_argument("--uptrend-m1-filter", type=str, default="off", help="off|close_above_ma6|close_above_ma12|close_above_ma20")
     ap.add_argument("--box-mode", type=str, default="off", help="off|d1_adx")
     ap.add_argument("--box-d1-adx-max", type=float, default=20.0)
+    ap.add_argument("--box-breakout-momo-atr", type=float, default=0.0, help="Allow entry inside box only when breakout+momo; candle body >= M*ATR")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1078,6 +1105,7 @@ def main():
         uptrend_m1_filter=str(args.uptrend_m1_filter),
         box_mode=str(args.box_mode),
         box_d1_adx_max=float(args.box_d1_adx_max),
+        box_breakout_momo_atr=float(args.box_breakout_momo_atr),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
