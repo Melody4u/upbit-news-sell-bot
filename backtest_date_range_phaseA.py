@@ -191,6 +191,7 @@ def simulate(
     pyramiding_enabled: bool = True,
     pos_cap_total: float = 0.90,
     downtrend_pos_cap: float = 0.30,
+    downtrend_max_entries_per_month: int = 5,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -253,6 +254,10 @@ def simulate(
     pos_frac = 1.0
     entry_ctx = ""
     entry_ctx_counts = {"l1": 0, "l2": 0, "other": 0}
+    dt_entries_by_month = {}
+    dt_entry_candidates = 0
+    dt_entry_skipped_monthcap = 0
+    dt_entry_taken = 0
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
@@ -329,6 +334,15 @@ def simulate(
 
             # keep for later (position management)
             downtrend_entry = bool(downtrend)
+
+            # Layer0: if downtrend, cap entry frequency per month
+            if downtrend_entry and int(downtrend_max_entries_per_month) > 0:
+                dt_entry_candidates += 1
+                mkey = f"{ts.year:04d}-{ts.month:02d}" if hasattr(ts, "year") else str(ts)[:7]
+                cur = int(dt_entries_by_month.get(mkey, 0))
+                if cur >= int(downtrend_max_entries_per_month):
+                    dt_entry_skipped_monthcap += 1
+                    continue
 
             # Phase A-ish: require some MTF score (>= scout_min)
             s = score_mtf(ts, df_by_itv, weights)
@@ -461,6 +475,12 @@ def simulate(
             early_cut_done = False
             in_pos = True
             entries += 1
+            # record downtrend entry frequency (per-month cap)
+            if bool(downtrend_entry) and int(downtrend_max_entries_per_month) > 0:
+                mkey = f"{ts.year:04d}-{ts.month:02d}" if hasattr(ts, "year") else str(ts)[:7]
+                dt_entries_by_month[mkey] = int(dt_entries_by_month.get(mkey, 0)) + 1
+                dt_entry_taken += 1
+
             addon_count = 0
             last_addon_i = i
             gate_hold = 0
@@ -789,6 +809,13 @@ def simulate(
         "mdd_pct": round(float(mdd_pct), 4),
         "mdd_ok": bool(mdd_ok),
         "downtrend_mode": str(downtrend_mode),
+        "downtrend_layer0": {
+            "pos_cap": float(downtrend_pos_cap),
+            "max_entries_per_month": int(downtrend_max_entries_per_month),
+            "dt_entry_candidates": int(dt_entry_candidates),
+            "dt_entry_taken": int(dt_entry_taken),
+            "dt_entry_skipped_monthcap": int(dt_entry_skipped_monthcap),
+        },
         "entries": total_entries,
         "legs": total_legs,
         "entries_per_month": round(float(entries_per_month), 2),
@@ -840,6 +867,7 @@ def main():
     ap.add_argument("--pyramiding", action="store_true", help="Enable pyramiding(scale-in)")
     ap.add_argument("--pos-cap-total", type=float, default=0.90)
     ap.add_argument("--downtrend-pos-cap", type=float, default=0.30)
+    ap.add_argument("--downtrend-max-entries-per-month", type=int, default=5)
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -905,6 +933,7 @@ def main():
         pyramiding_enabled=bool(args.pyramiding),
         pos_cap_total=float(args.pos_cap_total),
         downtrend_pos_cap=float(args.downtrend_pos_cap),
+        downtrend_max_entries_per_month=int(args.downtrend_max_entries_per_month),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
