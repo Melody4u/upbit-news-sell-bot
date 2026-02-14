@@ -1,0 +1,22 @@
+{
+  "market": "KRW-BTC",
+  "cache_dir": "ohlcv_cache",
+  "simulate_kwargs": {
+    "box_mode": "d1_adx",
+    "box_d1_adx_max": 30.0,
+    "riskoff_mode": "close_below_ma200",
+    "riskoff_tf": "day",
+    "riskoff_action": "block_new",
+    "wallst_v1": true,
+    "wallst_soft": true,
+    "highwr_v1": true,
+    "early_fail_enabled": true,
+    "early_fail_mode": "hybrid",
+    "pyramiding_enabled": true,
+    "pos_cap_total": 0.9,
+    "swing_stop_enabled": true,
+    "swing_stop_confirm_bars": 3,
+    "rem_exit_on_riskoff": false,
+    "rem_time_stop_bars": 0
+  }
+}

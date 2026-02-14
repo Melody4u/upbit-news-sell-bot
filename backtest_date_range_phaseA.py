@@ -256,6 +256,9 @@ def simulate(
     box_breakout_lookback: int = 10,
     box_breakout_confirm: int = 2,
     dump_trades_csv: str = "",  # optional path to dump per-leg/per-position records
+    # V2 exit levers (research): remainder risk control
+    rem_time_stop_bars: int = 0,
+    rem_exit_on_riskoff: bool = False,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -1004,9 +1007,30 @@ def simulate(
                     elif high >= tp2 and tp2 > 0:
                         exit_price = tp2
                         result = "win"
-                    elif i == len(df) - 1:
-                        exit_price = float(row["close"])
-                        result = "win" if exit_price > entry else "loss"
+                    else:
+                        # risk-off remainder exit (research lever): if risk-off now, exit at close
+                        if bool(rem_exit_on_riskoff):
+                            riskoff_now = False
+                            try:
+                                subd = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+                                if subd is not None and not subd.empty and "close" in subd.columns:
+                                    c = subd["close"].astype(float)
+                                    ma200 = c.rolling(200).mean()
+                                    if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]):
+                                        riskoff_now = bool(float(c.iloc[-1]) < float(ma200.iloc[-1]))
+                            except Exception:
+                                riskoff_now = False
+                            if riskoff_now:
+                                exit_price = float(row["close"])
+                                result = "loss" if exit_price < entry else "win"
+                        # time stop (research lever): after N bars from entry, exit at close
+                        if exit_price is None and int(rem_time_stop_bars) > 0:
+                            if int(i) - int(entry_i) >= int(rem_time_stop_bars):
+                                exit_price = float(row["close"])
+                                result = "loss" if exit_price < entry else "win"
+                        if exit_price is None and i == len(df) - 1:
+                            exit_price = float(row["close"])
+                            result = "win" if exit_price > entry else "loss"
 
                 if exit_price is not None:
                     gross_r = (exit_price - entry) / risk_unit
@@ -1014,6 +1038,29 @@ def simulate(
                     net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
                     remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
                     r_leg = float(net_r) * float(remain_ratio) * float(pos_frac)
+                    # classify remainder exit reason
+                    exit_reason = "rem"
+                    if bool(rem_exit_on_riskoff):
+                        # if risk-off exit triggered, mark
+                        if int(rem_time_stop_bars) > 0 and (int(i) - int(entry_i) >= int(rem_time_stop_bars)):
+                            # time-stop may also be true, but risk-off takes precedence if it set exit_price earlier
+                            pass
+                        # detect riskoff_now similarly to exit stage (best-effort)
+                        try:
+                            subd = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+                            if subd is not None and not subd.empty and "close" in subd.columns:
+                                c = subd["close"].astype(float)
+                                ma200 = c.rolling(200).mean()
+                                if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]):
+                                    if bool(float(c.iloc[-1]) < float(ma200.iloc[-1])):
+                                        exit_reason = "riskoff_rem"
+                        except Exception:
+                            pass
+                    if exit_reason == "rem" and int(rem_time_stop_bars) > 0 and (int(i) - int(entry_i) >= int(rem_time_stop_bars)):
+                        exit_reason = "time_stop_rem"
+                    if exit_reason == "rem" and i == len(df) - 1:
+                        exit_reason = "eod_rem"
+
                     legs.append({
                         "pos_id": pos_id,
                         "leg_idx": int(leg_idx),
@@ -1028,7 +1075,7 @@ def simulate(
                         "mae_r": float(mae_r),
                         "result": str(result),
                         "r": float(r_leg),
-                        "exit_reason": "rem",
+                        "exit_reason": exit_reason,
                     })
                     leg_idx += 1
                     legs_count += 1

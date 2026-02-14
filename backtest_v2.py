@@ -10,7 +10,9 @@ Next: move simulation logic into v2/sim.py and keep this as a thin CLI.
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -24,36 +26,32 @@ def main():
     ap.add_argument("--end", type=str, required=True)
     ap.add_argument("--cache-dir", type=str, default="ohlcv_cache")
     ap.add_argument("--dump-trades-csv", type=str, default="")
+    ap.add_argument("--preset", type=str, default=str(Path(__file__).resolve().parent / "v2" / "preset.json"))
     args = ap.parse_args()
 
     start = pd.Timestamp(datetime.fromisoformat(args.start))
     end = pd.Timestamp(datetime.fromisoformat(args.end))
 
-    # For now call v1 simulate with caching + dumps + v2 starter preset.
-    # V2 will replace this gradually.
+    preset_path = Path(args.preset)
+    preset = {}
+    try:
+        preset = json.loads(preset_path.read_text(encoding="utf-8"))
+    except Exception:
+        preset = {}
+
+    sim_kwargs = dict(preset.get("simulate_kwargs", {}) or {})
+    # CLI always wins
+    sim_kwargs.update({
+        "cache_dir": str(args.cache_dir),
+        "dump_trades_csv": str(args.dump_trades_csv),
+    })
+
+    # For now call v1 simulate with caching + dumps. V2 will replace this gradually.
     res = v1.simulate(
         args.market,
         start,
         end,
-        # Core regime controls (v2 direction): box + risk-off
-        box_mode="d1_adx",
-        box_d1_adx_max=30.0,
-        riskoff_mode="close_below_ma200",
-        riskoff_tf="day",
-        riskoff_action="block_new",
-        # Execution / exits: keep current v1 defaults for now
-        wallst_v1=True,
-        wallst_soft=True,
-        highwr_v1=True,
-        early_fail_enabled=True,
-        early_fail_mode="hybrid",
-        pyramiding_enabled=True,
-        pos_cap_total=0.90,
-        swing_stop_enabled=True,
-        swing_stop_confirm_bars=3,
-        # Ops
-        cache_dir=str(args.cache_dir),
-        dump_trades_csv=str(args.dump_trades_csv),
+        **sim_kwargs,
     )
     print(res)
 
