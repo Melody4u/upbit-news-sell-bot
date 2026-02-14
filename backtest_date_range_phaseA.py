@@ -201,6 +201,9 @@ def simulate(
     box_mode: str = "off",  # off|d1_adx
     box_d1_adx_max: float = 20.0,
     box_breakout_momo_atr: float = 0.0,  # 0 disables; allow entry in box only when breakout+momo
+    box_breakout_tf: str = "d3",  # d3|w1|h1
+    box_breakout_lookback: int = 10,
+    box_breakout_confirm: int = 2,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -242,6 +245,13 @@ def simulate(
         _m = dfd.copy().sort_index()
         # month-end candles derived from D1
         dfm = _m.resample("ME").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+
+    # D3 candles derived from D1 (3-day OHLCV)
+    df3 = pd.DataFrame()
+    if dfd is not None and (not dfd.empty) and isinstance(dfd.index, pd.DatetimeIndex):
+        _d = dfd.copy().sort_index()
+        # Use calendar-based 3D buckets; good enough for regime/breakout gating
+        df3 = _d.resample("3D").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
 
     df_by_itv = {"minute30": df30, "minute60": df60, "minute240": df240, "day": dfd, "week": dfw}
 
@@ -393,19 +403,46 @@ def simulate(
 
             if box:
                 box_true_count += 1
-                # Breakout+momo override (minimal knobs):
-                # - breakout: close > recent high (lookback fixed)
+                # Breakout+momo override (architecture):
+                # - breakout level from a higher timeframe (default: D3)
+                # - confirm: N closes above the level
                 # - momo: candle body >= M*ATR
                 if float(box_breakout_momo_atr) > 0:
-                    lookback = 48  # fixed: last 48x 60m bars (~2 days)
-                    if i >= lookback:
-                        recent_high = float(df["high"].iloc[i - lookback : i].max())
-                        body = float(close - open_p)
-                        if float(close) > recent_high and body >= float(box_breakout_momo_atr) * float(atr):
-                            box_breakout_allowed_count += 1
-                        else:
-                            box_breakout_blocked_count += 1
-                            continue
+                    tf = str(box_breakout_tf or "d3").lower()
+                    lookback = int(max(3, box_breakout_lookback))
+                    confirm = int(max(1, box_breakout_confirm))
+
+                    level = None
+                    if tf == "w1":
+                        sub = dfw[dfw.index <= ts] if isinstance(dfw.index, pd.DatetimeIndex) else pd.DataFrame()
+                        if sub is not None and len(sub) >= lookback:
+                            level = float(sub["high"].iloc[-lookback:].max())
+                    elif tf == "h1":
+                        if i >= lookback:
+                            level = float(df["high"].iloc[i - lookback : i].max())
+                    else:  # d3
+                        sub = df3[df3.index <= ts] if isinstance(df3.index, pd.DatetimeIndex) else pd.DataFrame()
+                        if sub is not None and len(sub) >= lookback:
+                            level = float(sub["high"].iloc[-lookback:].max())
+
+                    if level is None or not np.isfinite(level):
+                        box_breakout_blocked_count += 1
+                        continue
+
+                    # confirm: require last N closes above level
+                    ok_confirm = True
+                    for j in range(confirm):
+                        ii = i - j
+                        if ii < 0:
+                            ok_confirm = False
+                            break
+                        if float(df["close"].iloc[ii]) <= float(level):
+                            ok_confirm = False
+                            break
+
+                    body = float(close - open_p)
+                    if ok_confirm and body >= float(box_breakout_momo_atr) * float(atr):
+                        box_breakout_allowed_count += 1
                     else:
                         box_breakout_blocked_count += 1
                         continue
@@ -959,6 +996,9 @@ def simulate(
             "box_mode": str(box_mode),
             "box_d1_adx_max": float(box_d1_adx_max),
             "box_breakout_momo_atr": float(box_breakout_momo_atr),
+            "box_breakout_tf": str(box_breakout_tf),
+            "box_breakout_lookback": int(box_breakout_lookback),
+            "box_breakout_confirm": int(box_breakout_confirm),
             "box_true_count": int(box_true_count),
             "box_breakout_allowed_count": int(box_breakout_allowed_count),
             "box_breakout_blocked_count": int(box_breakout_blocked_count),
@@ -1031,6 +1071,9 @@ def main():
     ap.add_argument("--box-mode", type=str, default="off", help="off|d1_adx")
     ap.add_argument("--box-d1-adx-max", type=float, default=20.0)
     ap.add_argument("--box-breakout-momo-atr", type=float, default=0.0, help="Allow entry inside box only when breakout+momo; candle body >= M*ATR")
+    ap.add_argument("--box-breakout-tf", type=str, default="d3", help="Breakout TF for box override: d3|w1|h1")
+    ap.add_argument("--box-breakout-lookback", type=int, default=10, help="Lookback candles on breakout TF")
+    ap.add_argument("--box-breakout-confirm", type=int, default=2, help="Require N H1 closes above breakout level")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1106,6 +1149,9 @@ def main():
         box_mode=str(args.box_mode),
         box_d1_adx_max=float(args.box_d1_adx_max),
         box_breakout_momo_atr=float(args.box_breakout_momo_atr),
+        box_breakout_tf=str(args.box_breakout_tf),
+        box_breakout_lookback=int(args.box_breakout_lookback),
+        box_breakout_confirm=int(args.box_breakout_confirm),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
