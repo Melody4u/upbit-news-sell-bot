@@ -198,6 +198,8 @@ def simulate(
     uptrend_only: bool = False,
     uptrend_w1_filter: str = "off",  # off|close_above_ma200
     uptrend_m1_filter: str = "off",  # off|close_above_ma6|close_above_ma12|close_above_ma20
+    box_mode: str = "off",  # off|d1_adx
+    box_d1_adx_max: float = 20.0,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -274,6 +276,7 @@ def simulate(
     riskoff_ma200_nan_count = 0
     uptrend_true_count = 0
     uptrend_nan_count = 0
+    box_true_count = 0
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
@@ -375,6 +378,16 @@ def simulate(
 
             # If risk-off, optionally block new entries entirely (strong Layer0)
             if riskoff and str(riskoff_action or "block_new").lower() == "block_new":
+                continue
+
+            # Box(횡보) filter: if box, block new entries (position management still runs elsewhere)
+            box = False
+            if str(box_mode or "off").lower() == "d1_adx":
+                if subd1_dt is not None and not subd1_dt.empty and "adx" in subd1_dt.columns:
+                    a = float(subd1_dt["adx"].iloc[-1]) if pd.notna(subd1_dt["adx"].iloc[-1]) else 0.0
+                    box = bool(a > 0 and a < float(box_d1_adx_max))
+            if box:
+                box_true_count += 1
                 continue
 
             # Uptrend-only mode (A): allow NEW entries only when uptrend AND conditions hold
@@ -920,6 +933,9 @@ def simulate(
             "uptrend_only": bool(uptrend_only),
             "uptrend_w1_filter": str(uptrend_w1_filter),
             "uptrend_m1_filter": str(uptrend_m1_filter),
+            "box_mode": str(box_mode),
+            "box_d1_adx_max": float(box_d1_adx_max),
+            "box_true_count": int(box_true_count),
             "uptrend_true_count": int(uptrend_true_count),
             "uptrend_nan_count": int(uptrend_nan_count),
             "riskoff_true_count": int(riskoff_true_count),
@@ -986,6 +1002,8 @@ def main():
     ap.add_argument("--uptrend-only", action="store_true", help="Allow NEW entries only when uptrend conditions hold")
     ap.add_argument("--uptrend-w1-filter", type=str, default="off", help="off|close_above_ma200")
     ap.add_argument("--uptrend-m1-filter", type=str, default="off", help="off|close_above_ma6|close_above_ma12|close_above_ma20")
+    ap.add_argument("--box-mode", type=str, default="off", help="off|d1_adx")
+    ap.add_argument("--box-d1-adx-max", type=float, default=20.0)
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1058,6 +1076,8 @@ def main():
         uptrend_only=bool(args.uptrend_only),
         uptrend_w1_filter=str(args.uptrend_w1_filter),
         uptrend_m1_filter=str(args.uptrend_m1_filter),
+        box_mode=str(args.box_mode),
+        box_d1_adx_max=float(args.box_d1_adx_max),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
