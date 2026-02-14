@@ -195,6 +195,7 @@ def simulate(
     riskoff_mode: str = "none",  # none|close_below_ma200
     riskoff_tf: str = "day",     # day|h4
     riskoff_action: str = "block_new",  # block_new|cap_only
+    uptrend_only: bool = False,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -263,6 +264,8 @@ def simulate(
     dt_entry_taken = 0
     riskoff_true_count = 0
     riskoff_ma200_nan_count = 0
+    uptrend_true_count = 0
+    uptrend_nan_count = 0
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
@@ -350,7 +353,6 @@ def simulate(
                     sub = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
 
                 if sub is not None and not sub.empty and "close" in sub.columns:
-                    # Use the same-TF close vs MA200 on the same TF (avoid mixing 60m close with D1 MA)
                     c = sub["close"].astype(float)
                     ma200 = c.rolling(200).mean()
                     if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]):
@@ -366,6 +368,26 @@ def simulate(
             # If risk-off, optionally block new entries entirely (strong Layer0)
             if riskoff and str(riskoff_action or "block_new").lower() == "block_new":
                 continue
+
+            # Uptrend-only mode (A): allow NEW entries only when uptrend AND conditions hold
+            uptrend = False
+            if bool(uptrend_only):
+                if subd1_dt is not None and not subd1_dt.empty and "ema_fast" in subd1_dt.columns and "ema_slow" in subd1_dt.columns:
+                    c = subd1_dt["close"].astype(float)
+                    ma200 = c.rolling(200).mean()
+                    ef = float(subd1_dt["ema_fast"].iloc[-1]) if pd.notna(subd1_dt["ema_fast"].iloc[-1]) else np.nan
+                    es = float(subd1_dt["ema_slow"].iloc[-1]) if pd.notna(subd1_dt["ema_slow"].iloc[-1]) else np.nan
+                    if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]) and pd.notna(ef) and pd.notna(es):
+                        uptrend = bool(float(c.iloc[-1]) > float(ma200.iloc[-1]) and float(ef) > float(es))
+                    else:
+                        uptrend_nan_count += 1
+                else:
+                    uptrend_nan_count += 1
+
+                if uptrend:
+                    uptrend_true_count += 1
+                else:
+                    continue
 
             layer0_active = bool(downtrend_entry or riskoff)
 
@@ -848,6 +870,10 @@ def simulate(
             "max_entries_per_month": int(downtrend_max_entries_per_month),
             "riskoff_mode": str(riskoff_mode),
             "riskoff_tf": str(riskoff_tf),
+            "riskoff_action": str(riskoff_action),
+            "uptrend_only": bool(uptrend_only),
+            "uptrend_true_count": int(uptrend_true_count),
+            "uptrend_nan_count": int(uptrend_nan_count),
             "riskoff_true_count": int(riskoff_true_count),
             "riskoff_ma200_nan_count": int(riskoff_ma200_nan_count),
             "dt_entry_candidates": int(dt_entry_candidates),
@@ -909,6 +935,7 @@ def main():
     ap.add_argument("--riskoff-mode", type=str, default="none", help="none|close_below_ma200")
     ap.add_argument("--riskoff-tf", type=str, default="day", help="day|h4")
     ap.add_argument("--riskoff-action", type=str, default="block_new", help="block_new|cap_only")
+    ap.add_argument("--uptrend-only", action="store_true", help="Allow NEW entries only when (D1 close>MA200) AND (D1 EMA20>EMA50)")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -978,6 +1005,7 @@ def main():
         riskoff_mode=str(args.riskoff_mode),
         riskoff_tf=str(args.riskoff_tf),
         riskoff_action=str(args.riskoff_action),
+        uptrend_only=bool(args.uptrend_only),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
