@@ -19,10 +19,14 @@ function NowEpoch {
   return [double]([DateTimeOffset]::Now.ToUnixTimeSeconds())
 }
 
-function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$tag) {
+function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$tag, [string]$profile) {
   $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $outPath = Join-Path $logsDir "research_${market}_${tag}_${ts}.out.log"
-  $errPath = Join-Path $logsDir "research_${market}_${tag}_${ts}.err.log"
+  $outPath = Join-Path $logsDir "research_${market}_${tag}_${profile}_${ts}.out.log"
+  $errPath = Join-Path $logsDir "research_${market}_${tag}_${profile}_${ts}.err.log"
+
+  # Base profile = conservative but without extra filters.
+  # Improved profile = sisyphus-guided tweaks (confirm=3 + vol-spike block).
+  $confirmBars = if ($profile -eq 'IMP') { '3' } else { '2' }
 
   $args = @(
     $script,
@@ -45,8 +49,12 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
     '--downtrend-early-fail-min-r', '1.2',
     '--swing-stop',
     '--swing-stop-lookback', '20',
-    '--swing-stop-confirm-bars', '3'
+    '--swing-stop-confirm-bars', $confirmBars
   )
+
+  if ($profile -eq 'IMP') {
+    $args += @('--vol-spike-block', '--vol-spike-atr-mult', '2.5', '--vol-spike-hold-bars', '2')
+  }
 
   # Run synchronously so we always have a complete output file.
   $p = Start-Process -FilePath $py -ArgumentList $args -WorkingDirectory $root -RedirectStandardOutput $outPath -RedirectStandardError $errPath -NoNewWindow -PassThru
@@ -57,6 +65,7 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
 
   return [pscustomobject]@{
     tag = $tag
+    profile = $profile
     market = $market
     start = $start
     end = $end
@@ -69,19 +78,26 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
 
 $run = [ordered]@{
   startedAt = (Get-Date).ToString('s')
-  note = 'Research worker: baseline backtests by year. No code changes. Safe to run on boot.'
+  note = 'Research worker: baseline vs improved (sisyphus-guided). Backtests only. Safe to run on boot.'
   runs = @()
 }
 
 try {
   # Half-year slices + 2025Q4 (stress)
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2023-01-01' -end '2023-07-01' -tag '2023H1')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2023-07-01' -end '2024-01-01' -tag '2023H2')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2024-01-01' -end '2024-07-01' -tag '2024H1')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2024-07-01' -end '2025-01-01' -tag '2024H2')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-01-01' -end '2025-07-01' -tag '2025H1')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-07-01' -end '2026-01-01' -tag '2025H2')
-  $run.runs += (Run-Backtest -market 'KRW-BTC' -start '2025-10-01' -end '2026-01-01' -tag '2025Q4')
+  $slices = @(
+    @{ tag = '2023H1'; start = '2023-01-01'; end = '2023-07-01' },
+    @{ tag = '2023H2'; start = '2023-07-01'; end = '2024-01-01' },
+    @{ tag = '2024H1'; start = '2024-01-01'; end = '2024-07-01' },
+    @{ tag = '2024H2'; start = '2024-07-01'; end = '2025-01-01' },
+    @{ tag = '2025H1'; start = '2025-01-01'; end = '2025-07-01' },
+    @{ tag = '2025H2'; start = '2025-07-01'; end = '2026-01-01' },
+    @{ tag = '2025Q4'; start = '2025-10-01'; end = '2026-01-01' }
+  )
+
+  foreach ($sl in $slices) {
+    $run.runs += (Run-Backtest -market 'KRW-BTC' -start $sl.start -end $sl.end -tag $sl.tag -profile 'BASE')
+    $run.runs += (Run-Backtest -market 'KRW-BTC' -start $sl.start -end $sl.end -tag $sl.tag -profile 'IMP')
+  }
 } catch {
   $run.error = $_.Exception.Message
 }
