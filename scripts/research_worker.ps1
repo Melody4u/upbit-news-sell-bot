@@ -60,6 +60,20 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
   $p = Start-Process -FilePath $py -ArgumentList $args -WorkingDirectory $root -RedirectStandardOutput $outPath -RedirectStandardError $errPath -NoNewWindow -PassThru
   $p.WaitForExit()
 
+  # Normalize encoding: Start-Process redirection can produce UTF-16; convert logs to UTF-8 for tooling.
+  try {
+    if (Test-Path -LiteralPath $outPath) {
+      $txt = Get-Content -LiteralPath $outPath -Raw -Encoding Unicode
+      Set-Content -LiteralPath $outPath -Value $txt -Encoding utf8
+    }
+    if (Test-Path -LiteralPath $errPath) {
+      $txte = Get-Content -LiteralPath $errPath -Raw -Encoding Unicode
+      Set-Content -LiteralPath $errPath -Value $txte -Encoding utf8
+    }
+  } catch {
+    # ignore; keep original files
+  }
+
   # heartbeat for watchdog-style monitoring
   Set-Content -LiteralPath $hbPath -Value (NowEpoch) -Encoding ascii
 
