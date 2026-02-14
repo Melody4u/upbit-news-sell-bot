@@ -210,6 +210,7 @@ def simulate(
     vol_spike_block_enabled: bool = False,
     vol_spike_block_atr_mult: float = 2.5,
     vol_spike_block_hold_bars: int = 2,
+    disable_addon_in_downtrend: bool = False,
     pause_sec: float = 0.12,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
@@ -522,14 +523,23 @@ def simulate(
                         max_addons = int(addon_max_l1)
                         add_f = float(addon_frac_l1)
 
-                    can_add = (
-                        good_now
-                        and (unreal_r > 0.0)
-                        and (gate_hold >= int(addon_hold_bars))
-                        and ((i - int(last_addon_i)) >= int(addon_min_bars))
-                        and (int(addon_count) < int(max_addons))
-                        and (float(pos_frac) < float(pos_cap_total) - 1e-9)
-                    )
+                    # Optional: disable add-on during downtrend (risk containment)
+                    try:
+                        _dt = bool(downtrend_now)
+                    except NameError:
+                        _dt = False
+
+                    if disable_addon_in_downtrend and _dt:
+                        can_add = False
+                    else:
+                        can_add = (
+                            good_now
+                            and (unreal_r > 0.0)
+                            and (gate_hold >= int(addon_hold_bars))
+                            and ((i - int(last_addon_i)) >= int(addon_min_bars))
+                            and (int(addon_count) < int(max_addons))
+                            and (float(pos_frac) < float(pos_cap_total) - 1e-9)
+                        )
 
                     if can_add:
                         new_pos = min(float(pos_cap_total), float(pos_frac) + max(0.0, float(add_f)))
@@ -843,6 +853,7 @@ def main():
     ap.add_argument("--vol-spike-block", action="store_true", help="Block entries after extreme range bar")
     ap.add_argument("--vol-spike-atr-mult", type=float, default=2.5)
     ap.add_argument("--vol-spike-hold-bars", type=int, default=2)
+    ap.add_argument("--disable-addon-in-downtrend", action="store_true")
     ap.add_argument("--fib-lookback", type=int, default=120)
     ap.add_argument("--fib-min", type=float, default=0.382)
     ap.add_argument("--fib-max", type=float, default=0.618)
@@ -906,6 +917,7 @@ def main():
         vol_spike_block_enabled=bool(args.vol_spike_block),
         vol_spike_block_atr_mult=float(args.vol_spike_atr_mult),
         vol_spike_block_hold_bars=int(args.vol_spike_hold_bars),
+        disable_addon_in_downtrend=bool(args.disable_addon_in_downtrend),
         fib_lookback=int(args.fib_lookback),
         fib_min=float(args.fib_min),
         fib_max=float(args.fib_max),
