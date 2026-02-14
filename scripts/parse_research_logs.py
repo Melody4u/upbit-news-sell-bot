@@ -11,7 +11,8 @@ LOGS = ROOT / "logs"
 def _read_text(p: pathlib.Path) -> str:
     # handle utf-8 / utf-8-sig / utf-16 gracefully
     raw = p.read_bytes()
-    for enc in ("utf-8", "utf-8-sig", "utf-16", "cp949"):
+    # Try utf-8-sig first to strip BOM (U+FEFF) which breaks ast.literal_eval
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "cp949"):
         try:
             return raw.decode(enc)
         except Exception:
