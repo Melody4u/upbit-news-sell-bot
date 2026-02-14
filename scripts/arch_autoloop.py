@@ -32,6 +32,7 @@ DUMPROOT = REPO / "tmp" / "arch_loop"
 STATE = DUMPROOT / "state.json"
 EVIDENCE = DUMPROOT / "evidence.json"
 CANDIDATES = DUMPROOT / "candidates.json"
+RUNS_LOG = DUMPROOT / "runs.jsonl"
 
 
 @dataclass
@@ -466,6 +467,61 @@ def main():
 
     print(persona_wallst(h2s))
     print(persona_crypto(h2s))
+
+    # 5) append run record (for daily report)
+    try:
+        base_score = score_run(evidence["baseline"]["H2"]["res"], evidence["baseline"]["Q4"]["res"])
+        new_score = score_run(base["H2"]["res"], base["Q4"]["res"])
+    except Exception:
+        base_score = 0.0
+        new_score = 0.0
+
+    def _ascii_safe(s: str) -> str:
+        try:
+            return (s or "").encode("utf-8", errors="ignore").decode("utf-8")
+        except Exception:
+            return str(s)
+
+    run_rec = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "focus": _ascii_safe(focus),
+        "ladder": {"A_H2": ladder_a, "B_Q4": ladder_b, "C_Long": "SKIP"},
+        "step": {
+            "from": int(current_step),
+            "to": int(best_step) if applied else int(current_step),
+            "jump": int(step_jump) if applied else 0,
+        },
+        "action": action,
+        "applied": bool(applied),
+        "reason": best_reason if applied else "",
+        "metrics": {
+            "H2": {
+                "return_pct": base["H2"]["res"].get("return_pct"),
+                "mdd_pct": base["H2"]["res"].get("mdd_pct"),
+                "entries": base["H2"]["res"].get("entries"),
+            },
+            "Q4": {
+                "return_pct": base["Q4"]["res"].get("return_pct"),
+                "mdd_pct": base["Q4"]["res"].get("mdd_pct"),
+                "entries": base["Q4"]["res"].get("entries"),
+            },
+        },
+        "delta": {
+            "score": float(new_score - base_score),
+        },
+        "runs": {
+            "backtest": int(runs_backtest),
+            "patch": int(runs_patch),
+            "rollback": int(runs_rollback),
+        },
+    }
+
+    try:
+        RUNS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with RUNS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(run_rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
