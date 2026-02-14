@@ -196,6 +196,8 @@ def simulate(
     riskoff_tf: str = "day",     # day|h4
     riskoff_action: str = "block_new",  # block_new|cap_only
     uptrend_only: bool = False,
+    uptrend_w1_filter: str = "off",  # off|close_above_ma200
+    uptrend_m1_filter: str = "off",  # off|close_above_ma20
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -231,6 +233,12 @@ def simulate(
     df240 = fetch_ohlcv_paged(market, "minute240", start - pd.Timedelta(days=120), end, pause_sec=pause_sec)
     dfd = fetch_ohlcv_paged(market, "day", start - pd.Timedelta(days=400), end, pause_sec=pause_sec)
     dfw = fetch_ohlcv_paged(market, "week", start - pd.Timedelta(days=2000), end, pause_sec=pause_sec)
+    # Month data: derive from D1 to avoid slow/unsupported monthly API fetches
+    dfm = pd.DataFrame()
+    if dfd is not None and (not dfd.empty) and isinstance(dfd.index, pd.DatetimeIndex):
+        _m = dfd.copy().sort_index()
+        # month-end candles derived from D1
+        dfm = _m.resample("ME").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
 
     df_by_itv = {"minute30": df30, "minute60": df60, "minute240": df240, "day": dfd, "week": dfw}
 
@@ -372,17 +380,53 @@ def simulate(
             # Uptrend-only mode (A): allow NEW entries only when uptrend AND conditions hold
             uptrend = False
             if bool(uptrend_only):
+                # Base D1 AND condition
+                d1_ok = False
                 if subd1_dt is not None and not subd1_dt.empty and "ema_fast" in subd1_dt.columns and "ema_slow" in subd1_dt.columns:
                     c = subd1_dt["close"].astype(float)
                     ma200 = c.rolling(200).mean()
                     ef = float(subd1_dt["ema_fast"].iloc[-1]) if pd.notna(subd1_dt["ema_fast"].iloc[-1]) else np.nan
                     es = float(subd1_dt["ema_slow"].iloc[-1]) if pd.notna(subd1_dt["ema_slow"].iloc[-1]) else np.nan
                     if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]) and pd.notna(ef) and pd.notna(es):
-                        uptrend = bool(float(c.iloc[-1]) > float(ma200.iloc[-1]) and float(ef) > float(es))
+                        d1_ok = bool(float(c.iloc[-1]) > float(ma200.iloc[-1]) and float(ef) > float(es))
                     else:
                         uptrend_nan_count += 1
                 else:
                     uptrend_nan_count += 1
+
+                # Optional W1 filter: close above MA200 on W1
+                w1_ok = True
+                if str(uptrend_w1_filter or "off").lower() == "close_above_ma200":
+                    subw = dfw[dfw.index <= ts] if isinstance(dfw.index, pd.DatetimeIndex) else pd.DataFrame()
+                    if subw is not None and not subw.empty and "close" in subw.columns:
+                        cw = subw["close"].astype(float)
+                        ma200w = cw.rolling(200).mean()
+                        if len(ma200w) > 0 and pd.notna(ma200w.iloc[-1]) and pd.notna(cw.iloc[-1]):
+                            w1_ok = bool(float(cw.iloc[-1]) > float(ma200w.iloc[-1]))
+                        else:
+                            uptrend_nan_count += 1
+                            w1_ok = False
+                    else:
+                        uptrend_nan_count += 1
+                        w1_ok = False
+
+                # Optional M1 filter: close above MA20 on M1 (MA200 is too long for available history)
+                m1_ok = True
+                if str(uptrend_m1_filter or "off").lower() == "close_above_ma20":
+                    subm = dfm[dfm.index <= ts] if isinstance(dfm.index, pd.DatetimeIndex) else pd.DataFrame()
+                    if subm is not None and not subm.empty and "close" in subm.columns:
+                        cm = subm["close"].astype(float)
+                        ma20m = cm.rolling(20).mean()
+                        if len(ma20m) > 0 and pd.notna(ma20m.iloc[-1]) and pd.notna(cm.iloc[-1]):
+                            m1_ok = bool(float(cm.iloc[-1]) > float(ma20m.iloc[-1]))
+                        else:
+                            uptrend_nan_count += 1
+                            m1_ok = False
+                    else:
+                        uptrend_nan_count += 1
+                        m1_ok = False
+
+                uptrend = bool(d1_ok and w1_ok and m1_ok)
 
                 if uptrend:
                     uptrend_true_count += 1
@@ -872,6 +916,8 @@ def simulate(
             "riskoff_tf": str(riskoff_tf),
             "riskoff_action": str(riskoff_action),
             "uptrend_only": bool(uptrend_only),
+            "uptrend_w1_filter": str(uptrend_w1_filter),
+            "uptrend_m1_filter": str(uptrend_m1_filter),
             "uptrend_true_count": int(uptrend_true_count),
             "uptrend_nan_count": int(uptrend_nan_count),
             "riskoff_true_count": int(riskoff_true_count),
@@ -935,7 +981,9 @@ def main():
     ap.add_argument("--riskoff-mode", type=str, default="none", help="none|close_below_ma200")
     ap.add_argument("--riskoff-tf", type=str, default="day", help="day|h4")
     ap.add_argument("--riskoff-action", type=str, default="block_new", help="block_new|cap_only")
-    ap.add_argument("--uptrend-only", action="store_true", help="Allow NEW entries only when (D1 close>MA200) AND (D1 EMA20>EMA50)")
+    ap.add_argument("--uptrend-only", action="store_true", help="Allow NEW entries only when uptrend conditions hold")
+    ap.add_argument("--uptrend-w1-filter", type=str, default="off", help="off|close_above_ma200")
+    ap.add_argument("--uptrend-m1-filter", type=str, default="off", help="off|close_above_ma20")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1006,6 +1054,8 @@ def main():
         riskoff_tf=str(args.riskoff_tf),
         riskoff_action=str(args.riskoff_action),
         uptrend_only=bool(args.uptrend_only),
+        uptrend_w1_filter=str(args.uptrend_w1_filter),
+        uptrend_m1_filter=str(args.uptrend_m1_filter),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
