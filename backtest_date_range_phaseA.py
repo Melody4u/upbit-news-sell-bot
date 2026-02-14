@@ -192,6 +192,9 @@ def simulate(
     pos_cap_total: float = 0.90,
     downtrend_pos_cap: float = 0.30,
     downtrend_max_entries_per_month: int = 5,
+    riskoff_mode: str = "none",  # none|close_below_ma200
+    riskoff_tf: str = "day",     # day|h4
+    riskoff_action: str = "block_new",  # block_new|cap_only
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -258,6 +261,8 @@ def simulate(
     dt_entry_candidates = 0
     dt_entry_skipped_monthcap = 0
     dt_entry_taken = 0
+    riskoff_true_count = 0
+    riskoff_ma200_nan_count = 0
     addon_count = 0
     last_addon_i = -10_000
     gate_hold = 0
@@ -320,8 +325,8 @@ def simulate(
             if dm not in ("h4", "d1", "or", "off"):
                 dm = "or"
             downtrend = (h4_down or d1_down) if dm == "or" else (h4_down if dm == "h4" else (d1_down if dm == "d1" else False))
-            if downtrend:
-                continue
+            # NOTE: In Layer0 risk-control mode we do NOT hard-block entries here.
+            # We only mark downtrend and let Layer0 caps/limits manage exposure & frequency.
 
             # Volatility spike block: after an extreme bar, skip new entries for N bars
             if vol_spike_block_enabled:
@@ -335,8 +340,37 @@ def simulate(
             # keep for later (position management)
             downtrend_entry = bool(downtrend)
 
-            # Layer0: if downtrend, cap entry frequency per month
-            if downtrend_entry and int(downtrend_max_entries_per_month) > 0:
+            # Layer0 (risk-off): close below MA200
+            riskoff = False
+            if str(riskoff_mode or "none").lower() == "close_below_ma200":
+                tf = str(riskoff_tf or "day").lower()
+                if tf == "h4":
+                    sub = df240[df240.index <= ts] if isinstance(df240.index, pd.DatetimeIndex) else pd.DataFrame()
+                else:
+                    sub = dfd[dfd.index <= ts] if isinstance(dfd.index, pd.DatetimeIndex) else pd.DataFrame()
+
+                if sub is not None and not sub.empty and "close" in sub.columns:
+                    # Use the same-TF close vs MA200 on the same TF (avoid mixing 60m close with D1 MA)
+                    c = sub["close"].astype(float)
+                    ma200 = c.rolling(200).mean()
+                    if len(ma200) > 0 and pd.notna(ma200.iloc[-1]) and pd.notna(c.iloc[-1]):
+                        riskoff = bool(float(c.iloc[-1]) < float(ma200.iloc[-1]))
+                    else:
+                        riskoff_ma200_nan_count += 1
+                else:
+                    riskoff_ma200_nan_count += 1
+
+            if riskoff:
+                riskoff_true_count += 1
+
+            # If risk-off, optionally block new entries entirely (strong Layer0)
+            if riskoff and str(riskoff_action or "block_new").lower() == "block_new":
+                continue
+
+            layer0_active = bool(downtrend_entry or riskoff)
+
+            # Layer0: cap entry frequency per month
+            if layer0_active and int(downtrend_max_entries_per_month) > 0:
                 dt_entry_candidates += 1
                 mkey = f"{ts.year:04d}-{ts.month:02d}" if hasattr(ts, "year") else str(ts)[:7]
                 cur = int(dt_entries_by_month.get(mkey, 0))
@@ -366,8 +400,8 @@ def simulate(
                         continue
                     pos_frac *= 0.4
 
-                # Layer0: cap exposure in downtrend (entry broad, growth narrow)
-                if bool(downtrend_entry):
+                # Layer0: cap exposure in downtrend/risk-off (entry broad, growth narrow)
+                if bool(layer0_active):
                     pos_frac = min(float(pos_frac), float(downtrend_pos_cap))
 
                 # good-gate context (Level 1/2/3) used for entry labeling / optional entry gating
@@ -476,7 +510,7 @@ def simulate(
             in_pos = True
             entries += 1
             # record downtrend entry frequency (per-month cap)
-            if bool(downtrend_entry) and int(downtrend_max_entries_per_month) > 0:
+            if bool(layer0_active) and int(downtrend_max_entries_per_month) > 0:
                 mkey = f"{ts.year:04d}-{ts.month:02d}" if hasattr(ts, "year") else str(ts)[:7]
                 dt_entries_by_month[mkey] = int(dt_entries_by_month.get(mkey, 0)) + 1
                 dt_entry_taken += 1
@@ -812,6 +846,10 @@ def simulate(
         "downtrend_layer0": {
             "pos_cap": float(downtrend_pos_cap),
             "max_entries_per_month": int(downtrend_max_entries_per_month),
+            "riskoff_mode": str(riskoff_mode),
+            "riskoff_tf": str(riskoff_tf),
+            "riskoff_true_count": int(riskoff_true_count),
+            "riskoff_ma200_nan_count": int(riskoff_ma200_nan_count),
             "dt_entry_candidates": int(dt_entry_candidates),
             "dt_entry_taken": int(dt_entry_taken),
             "dt_entry_skipped_monthcap": int(dt_entry_skipped_monthcap),
@@ -868,6 +906,9 @@ def main():
     ap.add_argument("--pos-cap-total", type=float, default=0.90)
     ap.add_argument("--downtrend-pos-cap", type=float, default=0.30)
     ap.add_argument("--downtrend-max-entries-per-month", type=int, default=5)
+    ap.add_argument("--riskoff-mode", type=str, default="none", help="none|close_below_ma200")
+    ap.add_argument("--riskoff-tf", type=str, default="day", help="day|h4")
+    ap.add_argument("--riskoff-action", type=str, default="block_new", help="block_new|cap_only")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -934,6 +975,9 @@ def main():
         pos_cap_total=float(args.pos_cap_total),
         downtrend_pos_cap=float(args.downtrend_pos_cap),
         downtrend_max_entries_per_month=int(args.downtrend_max_entries_per_month),
+        riskoff_mode=str(args.riskoff_mode),
+        riskoff_tf=str(args.riskoff_tf),
+        riskoff_action=str(args.riskoff_action),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
