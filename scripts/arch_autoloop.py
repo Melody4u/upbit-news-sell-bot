@@ -137,24 +137,56 @@ def save_preset(p: dict) -> None:
     PRESET.write_text(json.dumps(p, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def score_run(h2: dict, q4: dict) -> float:
+    # Higher is better.
+    # We mainly optimize H2 return and penalize H2 MDD; lightly penalize negative Q4 return.
+    h2_r = float(h2.get("return_pct", 0.0) or 0.0)
+    h2_mdd = float(h2.get("mdd_pct", 0.0) or 0.0)
+    q4_r = float(q4.get("return_pct", 0.0) or 0.0)
+
+    score = h2_r - (h2_mdd * 60.0)
+    if q4_r < 0:
+        score += q4_r * 0.5  # penalty
+    return float(score)
+
+
 def accept_patch(base_h2: dict, base_q4: dict, new_h2: dict, new_q4: dict) -> bool:
-    # Accept if H2 improves meaningfully and Q4 doesn't catastrophically regress.
-    def _r(x):
-        return float(x.get("return_pct", 0.0) or 0.0)
+    # Accept if score improves and Q4 doesn't catastrophically regress.
+    base_score = score_run(base_h2, base_q4)
+    new_score = score_run(new_h2, new_q4)
 
-    def _mdd(x):
-        return float(x.get("mdd_pct", 0.0) or 0.0)
+    q4_r_drop = float(base_q4.get("return_pct", 0.0) or 0.0) - float(new_q4.get("return_pct", 0.0) or 0.0)
+    return bool((new_score > base_score + 1.0) and q4_r_drop <= 3.0)
 
-    h2_r_improve = _r(new_h2) - _r(base_h2)
-    h2_mdd_improve = _mdd(base_h2) - _mdd(new_h2)
 
-    q4_r_drop = _r(base_q4) - _r(new_q4)
+def load_state() -> dict:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
-    return bool((h2_r_improve >= 2.0 or h2_mdd_improve >= 0.02) and q4_r_drop <= 3.0)
+
+def save_state(st: dict) -> None:
+    STATE.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def apply_candidate(preset: dict, cand: dict) -> tuple[dict, str]:
+    p = json.loads(json.dumps(preset))
+    sim = dict(p.get("simulate_kwargs", {}) or {})
+    for k, v in cand.items():
+        sim[k] = v
+    p["simulate_kwargs"] = sim
+    label = ", ".join([f"{k}={v}" for k, v in cand.items()])
+    return p, label
 
 
 def main():
     os.makedirs(DUMPROOT, exist_ok=True)
+
+    state = load_state()
+    tried = set(state.get("tried_labels", []) or [])
 
     # 1) baseline ladder
     base = {}
@@ -169,7 +201,7 @@ def main():
 
     focus = "rem 손실 집중" if "rem" in base_h2_s.get("loss_by_reason", {}) else "unknown"
 
-    # Ladder status (simple): PASS if return>=10 and mdd<=0.30 for H2; Q4 pass if return>=0
+    # Ladder status (simple)
     ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
     ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
 
@@ -178,23 +210,37 @@ def main():
     runs_patch = 0
     runs_rollback = 0
 
-    # 2) SAFE_PATCH: if A fails and rem dominates, try riskoff+time-stop
     applied = False
     preset0 = load_preset()
 
+    # 2) Candidate selection (SAFE_PATCH)
     rem_loss = float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0))
+    candidates: list[dict] = []
     if ladder_a == "FAIL" and rem_loss < -10.0:
-        p = load_preset()
-        sim = dict(p.get("simulate_kwargs", {}) or {})
-        # candidate levers (1~2): enable riskoff remainder exit + time stop 72 bars
-        sim["rem_exit_on_riskoff"] = True
-        sim["rem_time_stop_bars"] = 72
-        p["simulate_kwargs"] = sim
-        save_preset(p)
-        runs_patch += 1
-        action = "SAFE_PATCH: rem_exit_on_riskoff=true + rem_time_stop_bars=72"
+        candidates = [
+            {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 72},
+            {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 120},
+            {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 168},
+            {"rem_exit_on_riskoff": False, "rem_time_stop_bars": 120},
+            {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 0},
+            # right-tail attempt (keep it small): reduce TP1 ratio to leave more remainder
+            {"tp1_ratio": 0.4},
+        ]
 
-        # rerun ladder
+    best = None
+    best_label = ""
+    best_score = score_run(base_h2, base_q4)
+
+    # Try up to 2 new candidates per hour to control runtime.
+    for cand in candidates:
+        p2, label = apply_candidate(preset0, cand)
+        if label in tried:
+            continue
+
+        save_preset(p2)
+        runs_patch += 1
+        action = f"SAFE_PATCH 후보 테스트: {label}"
+
         new = {}
         for s in SLICES:
             res, dump = backtest(s, dump_name="patch")
@@ -202,31 +248,58 @@ def main():
             new[s.name] = {"res": res, "summ": summ}
         runs_backtest += 2
 
-        if accept_patch(base_h2, base_q4, new["H2"]["res"], new["Q4"]["res"]):
-            applied = True
-            base = new
-            base_h2 = base["H2"]["res"]
-            base_q4 = base["Q4"]["res"]
-            base_h2_s = base["H2"]["summ"]
-            ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
-            ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
-        else:
-            # rollback preset
-            save_preset(preset0)
-            runs_rollback += 1
+        new_score = score_run(new["H2"]["res"], new["Q4"]["res"])
+        tried.add(label)
 
-    # 3) commit if applied
+        if accept_patch(base_h2, base_q4, new["H2"]["res"], new["Q4"]["res"]):
+            if new_score > best_score:
+                best = new
+                best_label = label
+                best_score = new_score
+
+        # rollback after each candidate trial (we only persist best at end)
+        save_preset(preset0)
+        runs_rollback += 1
+
+        # limit attempts per cycle
+        if runs_patch >= 2:
+            break
+
+    # If we found a best accepted candidate, persist it.
+    if best is not None:
+        applied = True
+        # write preset with the best_label applied
+        # reconstruct candidate dict from label is messy; re-apply by searching candidates
+        for cand in candidates:
+            _p2, _label = apply_candidate(preset0, cand)
+            if _label == best_label:
+                save_preset(_p2)
+                break
+
+        base = best
+        base_h2 = base["H2"]["res"]
+        base_q4 = base["Q4"]["res"]
+        base_h2_s = base["H2"]["summ"]
+        ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
+        ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
+        action = f"ACCEPT: {best_label}"
+
+    # 3) persist state + commit accepted preset
+    state["tried_labels"] = sorted(list(tried))[-200:]
+    state["last_focus"] = focus
+    save_state(state)
+
     if applied:
         msg = (
-            f"auto: rem_exit_on_riskoff false->true, rem_time_stop_bars 0->72 | "
+            f"auto: {best_label} | "
             f"H2 return {base['H2']['res'].get('return_pct')} / mdd {base['H2']['res'].get('mdd_pct')} | "
             f"Q4 return {base['Q4']['res'].get('return_pct')} / mdd {base['Q4']['res'].get('mdd_pct')}"
         )
-        git(["add", str(PRESET)])
+        git(["add", str(PRESET), str(STATE)])
         git(["commit", "-m", msg])
         git(["push"])
 
-    # 4) story report (printed; cron will post this)
+    # 4) story report
     h2r = base["H2"]["res"]
     q4r = base["Q4"]["res"]
     h2s = base["H2"]["summ"]
@@ -235,11 +308,10 @@ def main():
     print(f"- Focus(원인): {focus}")
     print(f"- Ladder: A(H2)={ladder_a}, B(Q4)={ladder_b}, C(Long)=SKIP")
     print(f"- Action(이번): {action}")
-    print(f"- Result(전/후): 관측 기반" if (runs_patch == 0) else "- Result(전/후): 패치 적용")
+    print(f"- Result(전/후): 관측 기반" if (not applied) else "- Result(전/후): 개선 적용")
     print(f"  · H2: return {h2r.get('return_pct')} / mdd {h2r.get('mdd_pct')} / entries {h2r.get('entries')}")
     print(f"  · Q4: return {q4r.get('return_pct')} / mdd {q4r.get('mdd_pct')} / entries {q4r.get('entries')}")
 
-    # evidence
     loss = h2s.get("loss_by_reason", {})
     top2 = list(loss.items())[:2]
     top2s = ", ".join([f"{k} {v:.2f}R" for k, v in top2]) if top2 else "n/a"
