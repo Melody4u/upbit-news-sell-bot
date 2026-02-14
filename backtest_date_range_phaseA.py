@@ -5,7 +5,7 @@ Goal: approximate Phase A signal gating & count trades/PnL over a historical win
 - Intended for quick reality-check / trade frequency, not a perfect execution simulator.
 
 Usage (PowerShell):
-  .\.venv\Scripts\python.exe backtest_date_range_phaseA.py --market KRW-ETH --start 2025-01-01 --end 2025-10-31
+  .\\.venv\\Scripts\\python.exe backtest_date_range_phaseA.py --market KRW-ETH --start 2025-01-01 --end 2025-10-31
 
 Notes:
 - Interval for decision loop: 60m candles.
