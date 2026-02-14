@@ -21,3 +21,9 @@ logs/*.ps1
 /tmp_*.py
 /tmp*.py
 watchdog*.ps1
+
+# Local caches / dumps
+/tmp/
+tmp/
+tmp/**
+/ohlcv_cache/

@@ -19,12 +19,18 @@ Notes:
 import argparse
 import time
 import os
+import hashlib
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 import pyupbit
+
+
+def _cache_key(market: str, interval: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    s = f"{market}|{interval}|{start.date()}|{end.date()}".encode("utf-8")
+    return hashlib.sha1(s).hexdigest()[:16]
 
 
 def fetch_ohlcv_paged(market: str, interval: str, start: pd.Timestamp, end: pd.Timestamp, pause_sec: float = 0.12) -> pd.DataFrame:
@@ -70,6 +76,50 @@ def fetch_ohlcv_paged(market: str, interval: str, start: pd.Timestamp, end: pd.T
     out = out[~out.index.duplicated(keep="last")]
     out = out[(out.index >= start) & (out.index < end)]
     return out
+
+
+def fetch_ohlcv_cached(
+    market: str,
+    interval: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    pause_sec: float = 0.12,
+    cache_dir: str = "",
+) -> pd.DataFrame:
+    """Fetch OHLCV with local cache.
+
+    - cache_dir="" disables caching.
+    - Cache is safe because historical candles won't change materially.
+    """
+    cache_dir = str(cache_dir or "").strip()
+    if not cache_dir:
+        return fetch_ohlcv_paged(market, interval, start, end, pause_sec=pause_sec)
+
+    os.makedirs(cache_dir, exist_ok=True)
+    key = _cache_key(market, interval, start, end)
+    path = os.path.join(cache_dir, f"ohlcv_{market}_{interval}_{key}.parquet")
+
+    try:
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            if isinstance(df.index, pd.DatetimeIndex) and (not df.empty):
+                return df
+    except Exception:
+        pass
+
+    df = fetch_ohlcv_paged(market, interval, start, end, pause_sec=pause_sec)
+    try:
+        if df is not None and (not df.empty) and isinstance(df.index, pd.DatetimeIndex):
+            df.to_parquet(path)
+    except Exception:
+        # parquet may fail if pyarrow isn't installed; fallback to csv
+        try:
+            csv_path = path.replace(".parquet", ".csv")
+            df.to_csv(csv_path, encoding="utf-8-sig")
+        except Exception:
+            pass
+
+    return df
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -228,19 +278,20 @@ def simulate(
     vol_spike_block_hold_bars: int = 2,
     disable_addon_in_downtrend: bool = False,
     pause_sec: float = 0.12,
+    cache_dir: str = "",
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
-    # Fetch needed OHLCV
-    df60 = fetch_ohlcv_paged(market, "minute60", start, end, pause_sec=pause_sec)
+    # Fetch needed OHLCV (cached)
+    df60 = fetch_ohlcv_cached(market, "minute60", start, end, pause_sec=pause_sec, cache_dir=cache_dir)
     if df60.empty or len(df60) < 300:
         return {"error": "ohlcv_fetch_failed", "market": market}
 
-    # MTF frames
-    df30 = fetch_ohlcv_paged(market, "minute30", start - pd.Timedelta(days=30), end, pause_sec=pause_sec)
-    df240 = fetch_ohlcv_paged(market, "minute240", start - pd.Timedelta(days=120), end, pause_sec=pause_sec)
-    dfd = fetch_ohlcv_paged(market, "day", start - pd.Timedelta(days=400), end, pause_sec=pause_sec)
-    dfw = fetch_ohlcv_paged(market, "week", start - pd.Timedelta(days=2000), end, pause_sec=pause_sec)
+    # MTF frames (cached)
+    df30 = fetch_ohlcv_cached(market, "minute30", start - pd.Timedelta(days=30), end, pause_sec=pause_sec, cache_dir=cache_dir)
+    df240 = fetch_ohlcv_cached(market, "minute240", start - pd.Timedelta(days=120), end, pause_sec=pause_sec, cache_dir=cache_dir)
+    dfd = fetch_ohlcv_cached(market, "day", start - pd.Timedelta(days=400), end, pause_sec=pause_sec, cache_dir=cache_dir)
+    dfw = fetch_ohlcv_cached(market, "week", start - pd.Timedelta(days=2000), end, pause_sec=pause_sec, cache_dir=cache_dir)
     # Month data: derive from D1 to avoid slow/unsupported monthly API fetches
     dfm = pd.DataFrame()
     if dfd is not None and (not dfd.empty) and isinstance(dfd.index, pd.DatetimeIndex):
@@ -1222,6 +1273,7 @@ def main():
     ap.add_argument("--box-breakout-lookback", type=int, default=10, help="Lookback candles on breakout TF")
     ap.add_argument("--box-breakout-confirm", type=int, default=2, help="Require N H1 closes above breakout level")
     ap.add_argument("--dump-trades-csv", type=str, default="", help="Dump per-leg/per-position CSVs for reverse-analysis")
+    ap.add_argument("--cache-dir", type=str, default="ohlcv_cache", help="Local cache directory for OHLCV (parquet/csv)")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1301,6 +1353,7 @@ def main():
         box_breakout_lookback=int(args.box_breakout_lookback),
         box_breakout_confirm=int(args.box_breakout_confirm),
         dump_trades_csv=str(args.dump_trades_csv),
+        cache_dir=str(args.cache_dir),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
