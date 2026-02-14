@@ -1,18 +1,19 @@
 """Architecture auto-loop (V2 research-only).
 
-Now includes SAFE_PATCH (preset-only) auto-improvement:
-- Baseline ladder (H2/Q4)
-- If A(H2) fails with rem-loss dominant -> apply 1~2 levers:
-  * rem_exit_on_riskoff
-  * rem_time_stop_bars
-- Re-run ladder; accept if H2 improves without catastrophic Q4 regression.
-- Commit preset change with structured message; else rollback.
+Includes SAFE_PATCH (preset-only) auto-improvement + Sisyphus-catalog hook.
+
+Modes:
+- Baseline ladder (H2/Q4) + dump attribution summary
+- Write an evidence JSON (`tmp/arch_loop/evidence.json`) that an LLM("Sisyphus") can use
+- If a candidates file is provided, test those candidates (max N per cycle)
+- Otherwise, fall back to a small built-in heuristic candidate list
 
 No live trading logic is touched.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import os
@@ -29,6 +30,8 @@ BACKTEST_V2 = REPO / "backtest_v2.py"
 PRESET = REPO / "v2" / "preset.json"
 DUMPROOT = REPO / "tmp" / "arch_loop"
 STATE = DUMPROOT / "state.json"
+EVIDENCE = DUMPROOT / "evidence.json"
+CANDIDATES = DUMPROOT / "candidates.json"
 
 
 @dataclass
@@ -183,6 +186,11 @@ def apply_candidate(preset: dict, cand: dict) -> tuple[dict, str]:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--candidates", type=str, default=str(CANDIDATES))
+    ap.add_argument("--max-candidates", type=int, default=2)
+    args = ap.parse_args()
+
     os.makedirs(DUMPROOT, exist_ok=True)
 
     state = load_state()
@@ -201,7 +209,6 @@ def main():
 
     focus = "rem 손실 집중" if "rem" in base_h2_s.get("loss_by_reason", {}) else "unknown"
 
-    # Ladder status (simple)
     ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
     ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
 
@@ -213,17 +220,51 @@ def main():
     applied = False
     preset0 = load_preset()
 
-    # 2) Candidate selection (SAFE_PATCH)
     rem_loss = float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0))
+
+    # 1.5) write evidence for Sisyphus
+    evidence = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "focus": focus,
+        "ladder": {"A_H2": ladder_a, "B_Q4": ladder_b, "C_Long": "SKIP"},
+        "baseline": {
+            "H2": {"res": base_h2, "summ": base_h2_s},
+            "Q4": {"res": base_q4, "summ": base["Q4"]["summ"]},
+        },
+        "notes": {
+            "rem_loss": rem_loss,
+            "objective": "H2 개선 우선(수익↑/MDD↓), Q4 급격한 악화는 금지",
+            "knobs": [
+                "rem_exit_on_riskoff(bool)",
+                "rem_time_stop_bars(int)",
+                "tp1_ratio(float)",
+                "be_move_mode(str)",
+                "swing_stop_confirm_bars(int)",
+            ],
+        },
+    }
+    EVIDENCE.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    # 2) Candidate selection (SAFE_PATCH)
     candidates: list[dict] = []
-    if ladder_a == "FAIL" and rem_loss < -10.0:
+
+    # Try load candidates.json produced by Sisyphus (LLM). Expected: {"candidates": [ {..}, ... ]}
+    cand_path = Path(args.candidates)
+    if cand_path.exists():
+        try:
+            obj = json.loads(cand_path.read_text(encoding="utf-8"))
+            candidates = list(obj.get("candidates", []) or [])
+        except Exception:
+            candidates = []
+
+    # fallback heuristic catalog
+    if not candidates and ladder_a == "FAIL" and rem_loss < -10.0:
         candidates = [
             {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 72},
             {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 120},
             {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 168},
             {"rem_exit_on_riskoff": False, "rem_time_stop_bars": 120},
             {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 0},
-            # right-tail attempt (keep it small): reduce TP1 ratio to leave more remainder
             {"tp1_ratio": 0.4},
         ]
 
@@ -231,7 +272,10 @@ def main():
     best_label = ""
     best_score = score_run(base_h2, base_q4)
 
-    # Try up to 2 new candidates per hour to control runtime.
+    max_cands = int(max(0, args.max_candidates))
+    if max_cands <= 0:
+        candidates = []
+
     for cand in candidates:
         p2, label = apply_candidate(preset0, cand)
         if label in tried:
@@ -257,19 +301,14 @@ def main():
                 best_label = label
                 best_score = new_score
 
-        # rollback after each candidate trial (we only persist best at end)
         save_preset(preset0)
         runs_rollback += 1
 
-        # limit attempts per cycle
-        if runs_patch >= 2:
+        if runs_patch >= int(max(0, args.max_candidates)):
             break
 
-    # If we found a best accepted candidate, persist it.
     if best is not None:
         applied = True
-        # write preset with the best_label applied
-        # reconstruct candidate dict from label is messy; re-apply by searching candidates
         for cand in candidates:
             _p2, _label = apply_candidate(preset0, cand)
             if _label == best_label:
@@ -285,8 +324,9 @@ def main():
         action = f"ACCEPT: {best_label}"
 
     # 3) persist state + commit accepted preset
-    state["tried_labels"] = sorted(list(tried))[-200:]
+    state["tried_labels"] = sorted(list(tried))[-400:]
     state["last_focus"] = focus
+    state["last_evidence"] = str(EVIDENCE)
     save_state(state)
 
     if applied:
@@ -319,7 +359,7 @@ def main():
         f"- Evidence: H2 loss TOP2 {top2s} / posR mean {h2s.get('pos_r_mean'):.3f} min {h2s.get('pos_r_min'):.3f} max {h2s.get('pos_r_max'):.3f}"
     )
     print(f"- Runs: backtest {runs_backtest}회 / patch {runs_patch}회 / rollback {runs_rollback}회")
-    print("- Next: (WIP) 시시퍼스 최소변수 정리 + 레버 교체 정책 연결")
+    print(f"- Next: Sisyphus가 {EVIDENCE.name} 기반으로 {cand_path.name} 갱신 → 다음 사이클 테스트")
 
     print(persona_wallst(h2s))
     print(persona_crypto(h2s))
