@@ -190,6 +190,7 @@ def simulate(
     early_fail_strong_cut_ratios: str = "0.5,1.0",
     pyramiding_enabled: bool = True,
     pos_cap_total: float = 0.90,
+    downtrend_pos_cap: float = 0.30,
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -350,6 +351,10 @@ def simulate(
                     if not wallst_soft:
                         continue
                     pos_frac *= 0.4
+
+                # Layer0: cap exposure in downtrend (entry broad, growth narrow)
+                if bool(downtrend_entry):
+                    pos_frac = min(float(pos_frac), float(downtrend_pos_cap))
 
                 # good-gate context (Level 1/2/3) used for entry labeling / optional entry gating
                 # L1: 현실적 good (2-of-3: score, H4 trend, H4 ADX)
@@ -834,6 +839,7 @@ def main():
     # Pyramiding(scale-in) knobs
     ap.add_argument("--pyramiding", action="store_true", help="Enable pyramiding(scale-in)")
     ap.add_argument("--pos-cap-total", type=float, default=0.90)
+    ap.add_argument("--downtrend-pos-cap", type=float, default=0.30)
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -898,6 +904,7 @@ def main():
         good_gate_l3_score=int(args.good_gate_l3_score),
         pyramiding_enabled=bool(args.pyramiding),
         pos_cap_total=float(args.pos_cap_total),
+        downtrend_pos_cap=float(args.downtrend_pos_cap),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
