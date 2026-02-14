@@ -18,6 +18,7 @@ Notes:
 
 import argparse
 import time
+import os
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 
@@ -204,6 +205,7 @@ def simulate(
     box_breakout_tf: str = "d3",  # d1|d3|w1|h1
     box_breakout_lookback: int = 10,
     box_breakout_confirm: int = 2,
+    dump_trades_csv: str = "",  # optional path to dump per-leg/per-position records
     addon_fracs: str = "0.10,0.07,0.05,0.03",
     addon_min_bars: int = 1,
     addon_hold_bars: int = 2,
@@ -299,6 +301,18 @@ def simulate(
     legs_count = 0
     r_pos_sum = 0.0
     r_pos_count = 0
+
+    # trade dump / reverse-analysis ids
+    pos_seq = 0
+    pos_id = ""
+    entry_ts = None
+    entry_i = -1
+    leg_idx = 0
+    in_box_entry = False
+    riskoff_entry = False
+    box_breakout_used = False
+    mfe_r = 0.0
+    mae_r = 0.0
 
     equity = 1.0
     equity_peak = 1.0
@@ -403,6 +417,7 @@ def simulate(
 
             if box:
                 box_true_count += 1
+                box_breakout_used_now = False
                 # Breakout+momo override (architecture):
                 # - breakout level from a higher timeframe (default: D3)
                 # - confirm: N closes above the level
@@ -447,6 +462,7 @@ def simulate(
                     body = float(close - open_p)
                     if ok_confirm and body >= float(box_breakout_momo_atr) * float(atr):
                         box_breakout_allowed_count += 1
+                        box_breakout_used_now = True
                     else:
                         box_breakout_blocked_count += 1
                         continue
@@ -652,6 +668,19 @@ def simulate(
                 continue
             partial_done = False
             early_cut_done = False
+
+            # open a new position id for reverse-analysis dumps
+            pos_seq += 1
+            pos_id = f"pos{pos_seq:06d}"
+            entry_ts = ts
+            entry_i = int(i)
+            leg_idx = 0
+            in_box_entry = bool(box)
+            riskoff_entry = bool(riskoff)
+            box_breakout_used = bool(box_breakout_used_now) if ("box_breakout_used_now" in locals()) else False
+            mfe_r = 0.0
+            mae_r = 0.0
+
             in_pos = True
             entries += 1
             # record downtrend entry frequency (per-month cap)
@@ -672,6 +701,16 @@ def simulate(
 
             # Use initial risk (from entry to initial stop) for R calculations.
             risk_unit = max(1e-9, float(risk0))
+
+            # Track MFE/MAE in R (per-position, using initial risk)
+            try:
+                # favorable move: high
+                r_fav = (float(high) - float(entry)) / float(risk_unit)
+                r_adv = (float(low) - float(entry)) / float(risk_unit)
+                mfe_r = max(float(mfe_r), float(r_fav))
+                mae_r = min(float(mae_r), float(r_adv))
+            except Exception:
+                pass
 
             if highwr_v1:
                 # Pyramiding(scale-in): expand position only when L1/L2 holds; cap total exposure
@@ -810,7 +849,23 @@ def simulate(
                                 cost_leg = (cost_bps / 10000.0) * 2.0
                                 net_r_cut = gross_r_cut - (cost_leg / max(1e-9, risk_unit / entry))
                                 r_leg = float(net_r_cut) * float(ratio) * float(pos_frac)
-                                legs.append({"result": "loss", "r": r_leg, "leg": f"early_cut_{lvl:.2f}R"})
+                                legs.append({
+                                    "pos_id": pos_id,
+                                    "leg_idx": int(leg_idx),
+                                    "entry_ts": str(entry_ts),
+                                    "exit_ts": str(ts),
+                                    "entry_ctx": entry_ctx,
+                                    "addon_count": int(addon_count),
+                                    "in_box_entry": bool(in_box_entry),
+                                    "riskoff_entry": bool(riskoff_entry),
+                                    "box_breakout_used": bool(box_breakout_used),
+                                    "mfe_r": float(mfe_r),
+                                    "mae_r": float(mae_r),
+                                    "result": "loss",
+                                    "r": float(r_leg),
+                                    "exit_reason": f"early_cut_{lvl:.2f}R",
+                                })
+                                leg_idx += 1
                                 legs_count += 1
                                 r_total_pos += float(r_leg)
                                 early_cut_done = True
@@ -824,7 +879,23 @@ def simulate(
                     cost_leg = (cost_bps / 10000.0) * 2.0
                     net_r1 = gross_r1 - (cost_leg / max(1e-9, risk_unit / entry))
                     r_leg = float(net_r1) * float(tp1_ratio) * float(pos_frac)
-                    legs.append({"result": "win", "r": r_leg, "leg": "tp1"})
+                    legs.append({
+                        "pos_id": pos_id,
+                        "leg_idx": int(leg_idx),
+                        "entry_ts": str(entry_ts),
+                        "exit_ts": str(ts),
+                        "entry_ctx": entry_ctx,
+                        "addon_count": int(addon_count),
+                        "in_box_entry": bool(in_box_entry),
+                        "riskoff_entry": bool(riskoff_entry),
+                        "box_breakout_used": bool(box_breakout_used),
+                        "mfe_r": float(mfe_r),
+                        "mae_r": float(mae_r),
+                        "result": "win",
+                        "r": float(r_leg),
+                        "exit_reason": "tp1",
+                    })
+                    leg_idx += 1
                     legs_count += 1
                     r_total_pos += float(r_leg)
                     partial_done = True
@@ -892,13 +963,42 @@ def simulate(
                     net_r = gross_r - (cost_leg / max(1e-9, risk_unit / entry))
                     remain_ratio = (1.0 - float(tp1_ratio)) if partial_done else 1.0
                     r_leg = float(net_r) * float(remain_ratio) * float(pos_frac)
-                    legs.append({"result": result, "r": r_leg, "leg": "rem"})
+                    legs.append({
+                        "pos_id": pos_id,
+                        "leg_idx": int(leg_idx),
+                        "entry_ts": str(entry_ts),
+                        "exit_ts": str(ts),
+                        "entry_ctx": entry_ctx,
+                        "addon_count": int(addon_count),
+                        "in_box_entry": bool(in_box_entry),
+                        "riskoff_entry": bool(riskoff_entry),
+                        "box_breakout_used": bool(box_breakout_used),
+                        "mfe_r": float(mfe_r),
+                        "mae_r": float(mae_r),
+                        "result": str(result),
+                        "r": float(r_leg),
+                        "exit_reason": "rem",
+                    })
+                    leg_idx += 1
                     legs_count += 1
                     r_total_pos += float(r_leg)
 
                     # Close position: apply equity update ONCE per position using aggregated R
                     r_pos = float(r_total_pos)
-                    positions.append({"r": r_pos, "entry_ctx": entry_ctx, "addon_count": int(addon_count)})
+                    positions.append({
+                        "pos_id": pos_id,
+                        "entry_ts": str(entry_ts),
+                        "exit_ts": str(ts),
+                        "entry_ctx": entry_ctx,
+                        "addon_count": int(addon_count),
+                        "in_box_entry": bool(in_box_entry),
+                        "riskoff_entry": bool(riskoff_entry),
+                        "box_breakout_used": bool(box_breakout_used),
+                        "mfe_r": float(mfe_r),
+                        "mae_r": float(mae_r),
+                        "r": float(r_pos),
+                        "exit_reason_final": "rem",
+                    })
                     r_pos_sum += r_pos
                     r_pos_count += 1
 
@@ -930,9 +1030,38 @@ def simulate(
                     net_r = gross_r - (cost / max(1e-9, risk_unit / entry))
                     # basic mode: one leg == one position close
                     r_pos = float(net_r)
-                    legs.append({"result": result, "r": r_pos, "leg": "basic"})
+                    legs.append({
+                        "pos_id": pos_id,
+                        "leg_idx": int(leg_idx),
+                        "entry_ts": str(entry_ts),
+                        "exit_ts": str(ts),
+                        "entry_ctx": entry_ctx,
+                        "addon_count": int(addon_count),
+                        "in_box_entry": bool(in_box_entry),
+                        "riskoff_entry": bool(riskoff_entry),
+                        "box_breakout_used": bool(box_breakout_used),
+                        "mfe_r": float(mfe_r),
+                        "mae_r": float(mae_r),
+                        "result": str(result),
+                        "r": float(r_pos),
+                        "exit_reason": "basic",
+                    })
+                    leg_idx += 1
                     legs_count += 1
-                    positions.append({"r": r_pos, "entry_ctx": entry_ctx, "addon_count": int(addon_count)})
+                    positions.append({
+                        "pos_id": pos_id,
+                        "entry_ts": str(entry_ts),
+                        "exit_ts": str(ts),
+                        "entry_ctx": entry_ctx,
+                        "addon_count": int(addon_count),
+                        "in_box_entry": bool(in_box_entry),
+                        "riskoff_entry": bool(riskoff_entry),
+                        "box_breakout_used": bool(box_breakout_used),
+                        "mfe_r": float(mfe_r),
+                        "mae_r": float(mae_r),
+                        "r": float(r_pos),
+                        "exit_reason_final": "basic",
+                    })
                     r_pos_sum += r_pos
                     r_pos_count += 1
 
@@ -958,6 +1087,20 @@ def simulate(
     avg_r_pos = (float(r_pos_sum) / float(r_pos_count)) if r_pos_count > 0 else 0.0
 
     mdd_ok = bool(float(mdd_pct) <= float(mdd_limit_pct))
+
+    # Optional dump for reverse-analysis (entry/exit issues)
+    if str(dump_trades_csv or "").strip():
+        try:
+            out_path = str(dump_trades_csv)
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            # legs (execution events)
+            if legs:
+                pd.DataFrame(legs).to_csv(out_path.replace(".csv", "_legs.csv"), index=False, encoding="utf-8-sig")
+            # positions (per-entry totals)
+            if positions:
+                pd.DataFrame(positions).to_csv(out_path.replace(".csv", "_pos.csv"), index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
 
     return {
         "market": market,
@@ -1078,6 +1221,7 @@ def main():
     ap.add_argument("--box-breakout-tf", type=str, default="d3", help="Breakout TF for box override: d1|d3|w1|h1")
     ap.add_argument("--box-breakout-lookback", type=int, default=10, help="Lookback candles on breakout TF")
     ap.add_argument("--box-breakout-confirm", type=int, default=2, help="Require N H1 closes above breakout level")
+    ap.add_argument("--dump-trades-csv", type=str, default="", help="Dump per-leg/per-position CSVs for reverse-analysis")
     ap.add_argument("--addon-min-bars", type=int, default=1)
     ap.add_argument("--addon-hold-bars", type=int, default=2)
     ap.add_argument("--addon-max-l1", type=int, default=1)
@@ -1156,6 +1300,7 @@ def main():
         box_breakout_tf=str(args.box_breakout_tf),
         box_breakout_lookback=int(args.box_breakout_lookback),
         box_breakout_confirm=int(args.box_breakout_confirm),
+        dump_trades_csv=str(args.dump_trades_csv),
         addon_min_bars=int(args.addon_min_bars),
         addon_hold_bars=int(args.addon_hold_bars),
         addon_max_l1=int(args.addon_max_l1),
