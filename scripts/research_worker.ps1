@@ -33,6 +33,7 @@ function Run-Backtest([string]$market, [string]$start, [string]$end, [string]$ta
     '--market', $market,
     '--start', $start,
     '--end', $end,
+    '--pause-sec', '0.25',
     '--wallst-v1',
     '--wallst-soft',
     '--highwr-v1',

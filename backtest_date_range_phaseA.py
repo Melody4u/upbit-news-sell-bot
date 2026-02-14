@@ -38,9 +38,21 @@ def fetch_ohlcv_paged(market: str, interval: str, start: pd.Timestamp, end: pd.T
         safety += 1
         if safety > 5000:
             break
-        df = pyupbit.get_ohlcv(market, interval=interval, count=200, to=to)
+        # pyupbit/get_ohlcv can intermittently return None/empty (rate-limit / transient network).
+        df = None
+        for attempt in range(5):
+            try:
+                df = pyupbit.get_ohlcv(market, interval=interval, count=200, to=to)
+            except Exception:
+                df = None
+            if df is not None and (not df.empty):
+                break
+            # brief backoff
+            time.sleep(pause_sec * (1 + attempt))
+
         if df is None or df.empty:
             break
+
         df = df.sort_index()
         chunks.append(df)
         oldest = df.index[0]
@@ -198,19 +210,20 @@ def simulate(
     vol_spike_block_enabled: bool = False,
     vol_spike_block_atr_mult: float = 2.5,
     vol_spike_block_hold_bars: int = 2,
+    pause_sec: float = 0.12,
 ) -> Dict:
     weights = weights or {"minute30": 15, "minute60": 20, "minute240": 30, "day": 20, "week": 15}
 
     # Fetch needed OHLCV
-    df60 = fetch_ohlcv_paged(market, "minute60", start, end)
+    df60 = fetch_ohlcv_paged(market, "minute60", start, end, pause_sec=pause_sec)
     if df60.empty or len(df60) < 300:
         return {"error": "ohlcv_fetch_failed", "market": market}
 
     # MTF frames
-    df30 = fetch_ohlcv_paged(market, "minute30", start - pd.Timedelta(days=30), end)
-    df240 = fetch_ohlcv_paged(market, "minute240", start - pd.Timedelta(days=120), end)
-    dfd = fetch_ohlcv_paged(market, "day", start - pd.Timedelta(days=400), end)
-    dfw = fetch_ohlcv_paged(market, "week", start - pd.Timedelta(days=2000), end)
+    df30 = fetch_ohlcv_paged(market, "minute30", start - pd.Timedelta(days=30), end, pause_sec=pause_sec)
+    df240 = fetch_ohlcv_paged(market, "minute240", start - pd.Timedelta(days=120), end, pause_sec=pause_sec)
+    dfd = fetch_ohlcv_paged(market, "day", start - pd.Timedelta(days=400), end, pause_sec=pause_sec)
+    dfw = fetch_ohlcv_paged(market, "week", start - pd.Timedelta(days=2000), end, pause_sec=pause_sec)
 
     df_by_itv = {"minute30": df30, "minute60": df60, "minute240": df240, "day": dfd, "week": dfw}
 
@@ -796,6 +809,7 @@ def main():
     ap.add_argument("--end", required=True, help="YYYY-MM-DD (exclusive end)")
     ap.add_argument("--min-rr", type=float, default=3.0)
     ap.add_argument("--cost-bps", type=float, default=10.0)
+    ap.add_argument("--pause-sec", type=float, default=0.12, help="API paging pause (and retry backoff base) for OHLCV fetch")
     ap.add_argument("--wallst-v1", action="store_true", help="Enable Wall St v1 entry: D1 regime + fib pullback + EMA20 rebound")
     ap.add_argument("--wallst-soft", action="store_true", help="Soft gates for fib/rebound to keep trade frequency")
     ap.add_argument("--highwr-v1", action="store_true", help="Enable high win-rate v1 exits: TP1 partial + BE + TP2")
@@ -911,6 +925,7 @@ def main():
         early_fail_cut_ratios=str(args.early_fail_ratios),
         early_fail_strong_levels_r=str(args.early_fail_strong_levels),
         early_fail_strong_cut_ratios=str(args.early_fail_strong_ratios),
+        pause_sec=float(args.pause_sec),
     )
     print(res)
 

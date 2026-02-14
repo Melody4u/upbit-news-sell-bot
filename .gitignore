@@ -13,3 +13,11 @@ logs/*.heartbeat
 logs/runtime_state.json
 logs/market_risk.json
 logs/stop_alert_state.json
+logs/*.json
+logs/*.txt
+logs/*.ps1
+
+# Local scratch
+/tmp_*.py
+/tmp*.py
+watchdog*.ps1
