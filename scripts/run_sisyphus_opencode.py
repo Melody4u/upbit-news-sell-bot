@@ -53,6 +53,28 @@ ALLOWED = {
     "adx_min",
 }
 
+# Clamp ranges to keep candidates sane
+RANGES = {
+    "rem_time_stop_bars": (24, 360),
+    "tp1_ratio": (0.30, 0.70),
+    "tp1_r": (0.60, 2.50),
+    "tp2_r": (1.20, 3.00),
+    "adx_min": (10.0, 30.0),
+    "swing_stop_confirm_bars": (1, 5),
+}
+
+
+def clamp(k, v):
+    if k not in RANGES:
+        return v
+    lo, hi = RANGES[k]
+    try:
+        if isinstance(lo, int) and isinstance(hi, int):
+            return int(max(lo, min(hi, int(float(v)))))
+        return float(max(float(lo), min(float(hi), float(v))))
+    except Exception:
+        return v
+
 
 def validate(obj: dict) -> dict:
     cands = obj.get("candidates")
@@ -62,11 +84,12 @@ def validate(obj: dict) -> dict:
         cands = cands[:6]
     out = []
     seen = set()
+    axis_counts = {"rem": 0, "tp": 0, "be": 0, "swing": 0}
     for c in cands:
         if not isinstance(c, dict):
             continue
-        # filter unknown keys
-        c2 = {k: c[k] for k in c.keys() if k in ALLOWED}
+        # filter unknown keys + clamp ranges
+        c2 = {k: clamp(k, c[k]) for k in c.keys() if k in ALLOWED}
         if not c2:
             continue
         if not (1 <= len(c2.keys()) <= 3):
@@ -74,8 +97,25 @@ def validate(obj: dict) -> dict:
         key = json.dumps(c2, sort_keys=True)
         if key in seen:
             continue
+
+        # diversity: prevent too many candidates from the same axis
+        axis = None
+        if any(k.startswith("rem_") for k in c2.keys()):
+            axis = "rem"
+        elif any(k.startswith("tp") for k in c2.keys()):
+            axis = "tp"
+        elif "be_move_mode" in c2:
+            axis = "be"
+        elif "swing_stop_confirm_bars" in c2:
+            axis = "swing"
+
+        if axis and axis_counts.get(axis, 0) >= 3:
+            continue
+
         seen.add(key)
         out.append(c2)
+        if axis:
+            axis_counts[axis] = axis_counts.get(axis, 0) + 1
     if not out:
         raise ValueError("no valid candidates after validation")
     return {"candidates": out}

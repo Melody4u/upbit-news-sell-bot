@@ -77,6 +77,8 @@ def goal_constraints_for(mode: str, evidence: dict, state: dict) -> tuple[str, l
             "Q4 safety 유지(급격한 악화 금지)",
             "과최적화 위험 높은 복잡한 조건 추가 금지",
             "허용 knobs: rem_exit_on_riskoff, rem_time_stop_bars, tp1_ratio, be_move_mode, swing_stop_confirm_bars, tp1_r,tp2_r,adx_min",
+            "값 범위(권장): rem_time_stop_bars 24~360 / tp1_ratio 0.3~0.7 / tp1_r 0.6~2.5 / tp2_r 1.2~3.0 / adx_min 10~30",
+            "다양성 규칙: 같은 축(time_stop만/TP1만/BE만) 후보가 3개 초과 금지 — 최소 2개 축 섞기",
             f"현재 focus: {focus}",
         ]
         return goal, constraints
