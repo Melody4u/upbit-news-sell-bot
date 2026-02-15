@@ -19,6 +19,7 @@
     "rem_exit_on_riskoff": true,
     "rem_time_stop_bars": 144,
     "tp1_ratio": 0.4,
-    "be_move_mode": "weak_only"
+    "be_move_mode": "weak_only",
+    "tp1_r": 1.8
   }
 }
