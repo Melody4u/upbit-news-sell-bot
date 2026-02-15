@@ -191,11 +191,7 @@ def _q4_safe(base_q4: dict, new_q4: dict) -> bool:
 
 
 def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
-    """Return (best_step, reason).
-
-    Steps are cumulative; we check upward from current_step.
-    """
-    defs = step_ladder_defs()
+    """Return (best_step, reason)."""
     base_h2, base_q4 = base["H2"]["res"], base["Q4"]["res"]
     new_h2, new_q4 = new["H2"]["res"], new["Q4"]["res"]
     base_h2s, new_h2s = base["H2"]["summ"], new["H2"]["summ"]
@@ -203,14 +199,12 @@ def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
     if not _q4_safe(base_q4, new_q4):
         return current_step, "Q4 safety fail"
 
-    # Step4: original ladder goals
     a_pass = bool(float(new_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(new_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30)
     b_pass = bool(float(new_q4.get("return_pct", 0.0) or 0.0) >= 0.0)
 
-    # Rem improvement proxies (R deltas)
     base_rem = float(base_h2s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
     new_rem = float(new_h2s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
-    rem_improve = new_rem - base_rem  # less negative => positive improve
+    rem_improve = new_rem - base_rem
 
     base_mdd = float(base_h2.get("mdd_pct", 0.0) or 0.0)
     new_mdd = float(new_h2.get("mdd_pct", 0.0) or 0.0)
@@ -220,12 +214,7 @@ def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
     new_score = score_run(new_h2, new_q4)
 
     best = current_step
-    reason = ""
-
-    # S0 is safety gate (already passed if we got here)
-    if current_step <= 0:
-        best = max(best, 0)
-        reason = "S0 safety"
+    reason = "S0 safety"
 
     if rem_improve >= 1.0 or mdd_improve >= 0.005:
         best = max(best, 1)
@@ -244,6 +233,43 @@ def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
         reason = "S4 ladder pass"
 
     return best, reason
+
+
+def as0_level_hit(anchor: dict, cur: dict) -> tuple[int, str]:
+    """Return (level 0..10, reason) based on H2-only improvements vs anchor."""
+    # anchor/cur expected keys: rem_loss, mdd, maxR
+    a_rem = float(anchor.get("rem_loss", 0.0) or 0.0)
+    a_mdd = float(anchor.get("mdd", 0.0) or 0.0)
+    a_maxr = float(anchor.get("maxR", 0.0) or 0.0)
+    c_rem = float(cur.get("rem_loss", 0.0) or 0.0)
+    c_mdd = float(cur.get("mdd", 0.0) or 0.0)
+    c_maxr = float(cur.get("maxR", 0.0) or 0.0)
+
+    rem_imp = c_rem - a_rem
+    mdd_imp = a_mdd - c_mdd
+    maxr_imp = c_maxr - a_maxr
+
+    # Very small steps; can be further subdivided later.
+    rem_steps = [0.3, 0.6, 1.0, 1.6, 2.5, 4.0]
+    mdd_steps = [0.002, 0.004, 0.006, 0.01]
+    maxr_steps = [0.03, 0.06, 0.10]
+
+    lvl = 0
+    if rem_imp >= rem_steps[0] or mdd_imp >= mdd_steps[0] or maxr_imp >= maxr_steps[0]:
+        lvl = 1
+    if rem_imp >= rem_steps[1] or mdd_imp >= mdd_steps[1] or maxr_imp >= maxr_steps[1]:
+        lvl = 2
+    if rem_imp >= rem_steps[2] or mdd_imp >= mdd_steps[2] or maxr_imp >= maxr_steps[1]:
+        lvl = 3
+    if rem_imp >= rem_steps[3] or mdd_imp >= mdd_steps[3] or maxr_imp >= maxr_steps[2]:
+        lvl = 4
+    if rem_imp >= rem_steps[4] or mdd_imp >= 0.015:
+        lvl = 5
+    if rem_imp >= rem_steps[5] or mdd_imp >= 0.02:
+        lvl = 6
+    # keep 7-10 reserved for future (once we redefine S10=A etc)
+    reason = f"AS0 rem_imp={rem_imp:.2f}R mdd_imp={mdd_imp:.3f} maxR_imp={maxr_imp:.2f}"
+    return int(lvl), reason
 
 
 def load_state() -> dict:
@@ -280,6 +306,7 @@ def main():
     state = load_state()
     tried = set(state.get("tried_labels", []) or [])
     current_step = int(state.get("accept_step", 0) or 0)
+    as0_level = int(state.get("as0_level", 0) or 0)
 
     # 1) baseline ladder
     base = {}
@@ -308,6 +335,14 @@ def main():
     rem_loss = float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0))
 
     # 1.5) write evidence for Sisyphus
+    # set AS0 anchor once (H2-only)
+    if "as0_anchor" not in state:
+        state["as0_anchor"] = {
+            "rem_loss": float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0),
+            "mdd": float(base_h2.get("mdd_pct", 0.0) or 0.0),
+            "maxR": float(base_h2_s.get("pos_r_max", 0.0) or 0.0),
+        }
+
     evidence = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "focus": focus,
@@ -315,6 +350,10 @@ def main():
         "baseline": {
             "H2": {"res": base_h2, "summ": base_h2_s},
             "Q4": {"res": base_q4, "summ": base["Q4"]["summ"]},
+        },
+        "as0": {
+            "anchor": state.get("as0_anchor", {}),
+            "current_level": int(as0_level),
         },
         "notes": {
             "rem_loss": rem_loss,
@@ -384,19 +423,45 @@ def main():
 
         step_hit, reason = achieved_step(base, new, current_step)
 
-        # Auto-accept policy:
-        # - Prefer step progress (step_hit > current_step)
-        # - If step doesn't move but score improves, allow a "micro-accept" so changes can accumulate.
-        micro_accept = bool(step_hit == current_step and new_score > best_score + 0.5)
+        # AS0 micro-progress (H2-only). Applies when we're still at S0.
+        anchor = state.get("as0_anchor", {}) or {}
+        cur_h2 = {
+            "rem_loss": float(new["H2"]["summ"].get("loss_by_reason", {}).get("rem", 0.0) or 0.0),
+            "mdd": float(new["H2"]["res"].get("mdd_pct", 0.0) or 0.0),
+            "maxR": float(new["H2"]["summ"].get("pos_r_max", 0.0) or 0.0),
+        }
+        lvl_hit, lvl_reason = as0_level_hit(anchor, cur_h2) if int(current_step) == 0 else (0, "")
 
-        if step_hit > current_step or micro_accept:
-            # Prefer bigger step jumps; tie-break by score
-            if (step_hit > best_step) or (step_hit == best_step and new_score > best_score):
+        # Auto-accept policy:
+        # - Prefer step progress
+        # - Or AS0 micro-level progress (while in S0)
+        # - Or micro-accept by score improvement
+        micro_accept = bool(step_hit == current_step and new_score > best_score + 0.5)
+        as0_progress = bool(int(current_step) == 0 and int(lvl_hit) > int(as0_level))
+
+        if step_hit > current_step or as0_progress or micro_accept:
+            # Prefer bigger step jumps; then AS0 level; then score
+            better = False
+            if step_hit > best_step:
+                better = True
+            elif step_hit == best_step:
+                if int(current_step) == 0 and int(lvl_hit) > int(state.get("_best_as0_level", as0_level)):
+                    better = True
+                elif new_score > best_score:
+                    better = True
+
+            if better:
                 best = new
                 best_label = label
-                best_reason = reason if (step_hit > current_step) else f"micro_accept score {best_score:.2f}->{new_score:.2f}"
+                if step_hit > current_step:
+                    best_reason = reason
+                elif as0_progress:
+                    best_reason = f"AS0 {as0_level}->{lvl_hit} {lvl_reason}"
+                else:
+                    best_reason = f"micro_accept score {best_score:.2f}->{new_score:.2f}"
                 best_step = step_hit
                 best_score = new_score
+                state["_best_as0_level"] = int(lvl_hit)
 
         save_preset(preset0)
         runs_rollback += 1
@@ -420,6 +485,18 @@ def main():
         ladder_a = "PASS" if (float(base_h2.get("return_pct", 0.0) or 0.0) >= 10.0 and float(base_h2.get("mdd_pct", 1.0) or 1.0) <= 0.30) else "FAIL"
         ladder_b = "PASS" if float(base_q4.get("return_pct", 0.0) or 0.0) >= 0.0 else "FAIL"
         step_jump = int(best_step) - int(current_step)
+
+        # update AS0 level if we're in S0
+        if int(current_step) == 0:
+            anchor = state.get("as0_anchor", {}) or {}
+            cur_h2 = {
+                "rem_loss": float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0),
+                "mdd": float(base_h2.get("mdd_pct", 0.0) or 0.0),
+                "maxR": float(base_h2_s.get("pos_r_max", 0.0) or 0.0),
+            }
+            lvl_hit, _ = as0_level_hit(anchor, cur_h2)
+            state["as0_level"] = int(max(int(as0_level), int(lvl_hit)))
+
         action = f"ACCEPT(S{current_step}->S{best_step}, +{step_jump}): {best_label}"
 
     # 3) persist state + commit accepted preset
@@ -455,6 +532,8 @@ def main():
 
     print(f"[arch-loop] {datetime.now().strftime('%Y-%m-%d %H:00')}")
     print(f"- Focus(원인): {focus}")
+    if int(current_step) == 0:
+        print(f"- AS0: L{int(as0_level)}" + (f" -> L{int(state.get('as0_level', as0_level))}" if applied else ""))
     print(f"- Step: S{current_step}" + (f" -> S{best_step}(+{step_jump})" if applied else ""))
     print(f"- Ladder: A(H2)={ladder_a}, B(Q4)={ladder_b}, C(Long)=SKIP")
     print(f"- Action(이번): {action}")
