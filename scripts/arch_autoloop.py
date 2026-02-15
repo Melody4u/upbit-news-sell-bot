@@ -383,12 +383,18 @@ def main():
         tried.add(label)
 
         step_hit, reason = achieved_step(base, new, current_step)
-        if step_hit > current_step:
+
+        # Auto-accept policy:
+        # - Prefer step progress (step_hit > current_step)
+        # - If step doesn't move but score improves, allow a "micro-accept" so changes can accumulate.
+        micro_accept = bool(step_hit == current_step and new_score > best_score + 0.5)
+
+        if step_hit > current_step or micro_accept:
             # Prefer bigger step jumps; tie-break by score
             if (step_hit > best_step) or (step_hit == best_step and new_score > best_score):
                 best = new
                 best_label = label
-                best_reason = reason
+                best_reason = reason if (step_hit > current_step) else f"micro_accept score {best_score:.2f}->{new_score:.2f}"
                 best_step = step_hit
                 best_score = new_score
 
