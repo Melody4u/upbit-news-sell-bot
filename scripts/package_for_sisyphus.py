@@ -55,12 +55,28 @@ def determine_mode(state: dict) -> str:
 def goal_constraints_for(mode: str, evidence: dict, state: dict) -> tuple[str, list[str]]:
     focus = evidence.get("focus", "")
     if mode == "AS0":
-        goal = "AS0 accept(미세 개선) 만들기: rem 손실 소폭↓ 또는 H2 MDD 소폭↓ 또는 maxR(승자꼬리) 소폭↑"
+        lvl = int(state.get("as0_level", 0) or 0)
+        cfg = dict(state.get("as0_cfg", {}) or {})
+        rem_steps = list(cfg.get("rem_steps") or [])
+        mdd_steps = list(cfg.get("mdd_steps") or [])
+        maxr_steps = list(cfg.get("maxr_steps") or [])
+
+        # pick next target thresholds (best-effort)
+        rem_t = rem_steps[lvl] if lvl < len(rem_steps) else (rem_steps[-1] if rem_steps else 1.0)
+        mdd_t = mdd_steps[min(lvl, len(mdd_steps) - 1)] if mdd_steps else 0.004
+        maxr_t = maxr_steps[min(lvl, len(maxr_steps) - 1)] if maxr_steps else 0.06
+
+        goal = (
+            f"AS0-L{lvl+1} 달성: (anchor 대비) rem 개선 ≥ {rem_t:.2f}R "
+            f"또는 H2 MDD 개선 ≥ {mdd_t:.3f} "
+            f"또는 maxR 개선 ≥ {maxr_t:.2f} 중 1개 이상"
+        )
         constraints = [
-            "후보는 1~3 레버 조합만",
+            "후보는 1~3 레버 조합만(딱 1~2개도 OK)",
             "후보는 최대 6개",
             "Q4 safety 유지(급격한 악화 금지)",
             "과최적화 위험 높은 복잡한 조건 추가 금지",
+            "허용 knobs: rem_exit_on_riskoff, rem_time_stop_bars, tp1_ratio, be_move_mode, swing_stop_confirm_bars, tp1_r,tp2_r,adx_min",
             f"현재 focus: {focus}",
         ]
         return goal, constraints
