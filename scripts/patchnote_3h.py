@@ -21,6 +21,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 AUTOLOOP = REPO / "scripts" / "arch_autoloop.py"
+GEN_CANDS = REPO / "scripts" / "generate_candidates.py"
 DUMPROOT = REPO / "tmp" / "arch_loop"
 RUNS_LOG = DUMPROOT / "runs.jsonl"
 STATE = DUMPROOT / "state.json"
@@ -93,8 +94,14 @@ def main():
     now = now_kst()
     since = now - timedelta(hours=3)
 
-    # 1) Run autoloop once to record a fresh run line
+    # 1) Baseline run to refresh evidence.json
     env = dict(**{**dict(**subprocess.os.environ), "PYTHONIOENCODING": "utf-8"})
+    subprocess.run([str(PY), str(AUTOLOOP), "--max-candidates", "0"], cwd=str(REPO), check=True, env=env)
+
+    # 2) Generate candidates.json from evidence.json (pipeline proof; later replaced by Sisyphus)
+    subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
+
+    # 3) Run autoloop to test candidates and possibly accept
     subprocess.run([str(PY), str(AUTOLOOP)], cwd=str(REPO), check=True, env=env)
 
     # 2) Summarize last 3h

@@ -521,7 +521,8 @@ def main():
             f"H2 {base['H2']['res'].get('return_pct')} mdd {base['H2']['res'].get('mdd_pct')} | "
             f"Q4 {base['Q4']['res'].get('return_pct')} mdd {base['Q4']['res'].get('mdd_pct')}"
         )
-        git(["add", str(PRESET), str(STATE)])
+        # Only commit preset (tmp/** is gitignored, state stays local)
+        git(["add", str(PRESET)])
         git(["commit", "-m", msg])
         git(["push"])
 
