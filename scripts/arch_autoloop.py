@@ -639,6 +639,20 @@ def main():
     print(
         f"- Evidence: H2 loss TOP2 {top2s} / posR mean {h2s.get('pos_r_mean'):.3f} min {h2s.get('pos_r_min'):.3f} max {h2s.get('pos_r_max'):.3f}"
     )
+    # policy eval hint (best-effort)
+    try:
+        if POLICY_EVAL.exists():
+            pol = json.loads(POLICY_EVAL.read_text(encoding="utf-8"))
+            print(f"- Policy: benefit {pol.get('benefit',0):.2f} / risk {pol.get('risk',0):.2f} / Δscore {pol.get('delta_score',0):.2f}")
+    except Exception:
+        pass
+
+    if int(current_step) == 0:
+        try:
+            print(f"- AS0-stuck: {int(state.get('as0_stuck',0))}/{int(state.get('as0_stuck_cycles',5))}")
+        except Exception:
+            pass
+
     print(f"- Runs: backtest {runs_backtest}회 / patch {runs_patch}회 / rollback {runs_rollback}회")
     print(f"- Next: Sisyphus가 {EVIDENCE.name} 기반으로 {cand_path.name} 갱신 → 다음 사이클 테스트")
 

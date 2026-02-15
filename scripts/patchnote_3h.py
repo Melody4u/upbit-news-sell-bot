@@ -197,6 +197,23 @@ def main():
         q4 = m.get("Q4", {})
         print(f"- Metrics: H2 {h2.get('return_pct')}% / mdd {h2.get('mdd_pct')} / entries {h2.get('entries')} | Q4 {q4.get('return_pct')}% / mdd {q4.get('mdd_pct')} / entries {q4.get('entries')}")
 
+    # Policy eval + AS0 status (if present)
+    try:
+        pol_path = DUMPROOT / "policy_eval.json"
+        if pol_path.exists():
+            pol = json.loads(pol_path.read_text(encoding="utf-8"))
+            print(f"- Policy: benefit {pol.get('benefit',0):.2f} / risk {pol.get('risk',0):.2f} / Δscore {pol.get('delta_score',0):.2f}")
+    except Exception:
+        pass
+    try:
+        st_path = DUMPROOT / "state.json"
+        if st_path.exists():
+            st = json.loads(st_path.read_text(encoding='utf-8'))
+            if int(st.get('accept_step',0) or 0) == 0:
+                print(f"- AS0: L{int(st.get('as0_level',0))} / stuck {int(st.get('as0_stuck',0))}/{int(st.get('as0_stuck_cycles',5))}")
+    except Exception:
+        pass
+
     # patchnotes from git
     notes = git_notes(since)
     if notes:
