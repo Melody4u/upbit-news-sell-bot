@@ -120,13 +120,15 @@ def main():
         try:
             subprocess.run([str(PY), str(sis)], cwd=str(REPO), check=True, env=env)
         except Exception:
-            # fallback if OpenCode output is invalid or parsing fails
             subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
     else:
         subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
 
-    # 3) Run autoloop to test candidates and possibly accept
-    subprocess.run([str(PY), str(AUTOLOOP)], cwd=str(REPO), check=True, env=env)
+    # 3) Adaptive budget: when confidence is OK, test fewer candidates to save time/cost.
+    max_cands = "2" if confidence == "LOW" else "1"
+
+    # 4) Run autoloop to test candidates and possibly accept
+    subprocess.run([str(PY), str(AUTOLOOP), "--max-candidates", max_cands], cwd=str(REPO), check=True, env=env)
 
     # 2) Summarize last 3h
     runs = load_runs(since)

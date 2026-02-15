@@ -48,6 +48,11 @@ SLICES = [
     Slice("Q4", "2025-10-01", "2026-01-01"),
 ]
 
+# Holdout slices to reduce overfitting (not used for candidate selection every cycle)
+HOLDOUT = [
+    Slice("HOLDOUT_2024H1", "2024-01-01", "2024-07-01"),
+]
+
 
 def run(cmd: list[str]) -> str:
     p = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True)
@@ -371,9 +376,24 @@ def main():
             "maxr_steps": [0.03, 0.06, 0.10]
         }
 
+    # failure-type taxonomy (helps auto lever switching)
+    try:
+        base_maxr = float(base_h2_s.get("pos_r_max", 0.0) or 0.0)
+        fail_type = []
+        if float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0) < -10.0:
+            fail_type.append("rem_tail")
+        if base_maxr < 0.6:
+            fail_type.append("short_tail")
+        if float(base_q4.get("return_pct", 0.0) or 0.0) < 0:
+            fail_type.append("q4_red")
+        failure_type = "+".join(fail_type) if fail_type else "unknown"
+    except Exception:
+        failure_type = "unknown"
+
     evidence = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "focus": focus,
+        "failure_type": failure_type,
         "ladder": {"A_H2": ladder_a, "B_Q4": ladder_b, "C_Long": "SKIP"},
         "baseline": {
             "H2": {"res": base_h2, "summ": base_h2_s},
@@ -424,13 +444,21 @@ def main():
     base_rem0 = float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
     base_maxr0 = float(base_h2_s.get("pos_r_max", 0.0) or 0.0)
 
+    base_entries0 = float(base_h2.get("entries", 0.0) or 0.0)
+
     def score_ext(h2_res: dict, q4_res: dict, h2_summ: dict) -> float:
         s = float(score_run(h2_res, q4_res))
         rem = float(h2_summ.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
         maxr = float(h2_summ.get("pos_r_max", 0.0) or 0.0)
+        entries = float(h2_res.get("entries", 0.0) or 0.0)
+
         # rem less negative is better; maxR higher is better
         s += 0.15 * (rem - base_rem0)
         s += 1.5 * (maxr - base_maxr0)
+
+        # sample-size penalty: avoid "improvement" only by trading much less
+        if base_entries0 > 0 and entries < base_entries0 * 0.7:
+            s -= 3.0
         return float(s)
 
     best = None
@@ -599,23 +627,43 @@ def main():
     except Exception:
         policy = {"benefit": 0.0, "risk": 0.0}
 
+    # Holdout check policy: run holdout only when applied OR every N cycles.
+    holdout_ok = True
+    holdout_note = ""
+    holdout_every = int(state.get("holdout_every", 4) or 4)
+    state["cycle_count"] = int(state.get("cycle_count", 0) or 0) + 1
+    do_holdout = bool(applied or (state["cycle_count"] % holdout_every == 0))
+    if do_holdout:
+        try:
+            s = HOLDOUT[0]
+            hres, hdump = backtest(s, dump_name="hold")
+            # Simple guard: don't accept if holdout MDD explodes > 0.7
+            if float(hres.get("mdd_pct", 0.0) or 0.0) > 0.7:
+                holdout_ok = False
+                holdout_note = f"holdout_mdd={hres.get('mdd_pct')}"
+            else:
+                holdout_note = f"holdout_mdd={hres.get('mdd_pct')}"
+        except Exception as e:
+            # if holdout fails due to data fetch, don't block but record
+            holdout_ok = True
+            holdout_note = f"holdout_err={type(e).__name__}"
+
     if applied:
-        # Only proceed if benefit outweighs risk.
-        if float(policy.get("benefit", 0.0)) >= float(policy.get("risk", 0.0)):
+        # Only proceed if benefit outweighs risk and holdout is ok.
+        if float(policy.get("benefit", 0.0)) >= float(policy.get("risk", 0.0)) and holdout_ok:
             msg = (
                 f"auto[S{current_step}->S{best_step}]: {best_label} | {best_reason} | "
                 f"H2 {base['H2']['res'].get('return_pct')} mdd {base['H2']['res'].get('mdd_pct')} | "
                 f"Q4 {base['Q4']['res'].get('return_pct')} mdd {base['Q4']['res'].get('mdd_pct')}"
             )
-            # Only commit preset (tmp/** is gitignored, state stays local)
             git(["add", str(PRESET)])
             git(["commit", "-m", msg])
             git(["push"])
         else:
-            # reject: rollback preset
             save_preset(preset0)
             applied = False
-            action = f"REJECT(policy): benefit<{policy.get('risk',0):.2f} (rollback)"
+            why = "policy" if float(policy.get("benefit", 0.0)) < float(policy.get("risk", 0.0)) else "holdout"
+            action = f"REJECT({why}): rollback ({holdout_note})"
 
     # 4) story report
     h2r = base["H2"]["res"]
