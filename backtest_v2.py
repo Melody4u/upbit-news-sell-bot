@@ -40,6 +40,16 @@ def main():
         preset = {}
 
     sim_kwargs = dict(preset.get("simulate_kwargs", {}) or {})
+
+    # Filter unknown kwargs to avoid crashing simulate() when candidates/preset contain extra keys.
+    try:
+        import inspect
+
+        allowed = set(inspect.signature(v1.simulate).parameters.keys())
+        sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in allowed}
+    except Exception:
+        pass
+
     # CLI always wins
     sim_kwargs.update({
         "cache_dir": str(args.cache_dir),

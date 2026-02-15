@@ -14,6 +14,7 @@ This script prints a single message suitable for chat.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -112,8 +113,17 @@ def main():
         subprocess.run([str(PY), str(PKG_SIS)], cwd=str(REPO), check=True, env=env)
         subprocess.run([str(PY), str(PERSONA)], cwd=str(REPO), check=True, env=env)
 
-    # 2) Generate candidates.json from evidence.json (pipeline proof; later replaced by Sisyphus)
-    subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
+    # 2) Generate candidates.json
+    # Prefer OpenCode-driven Sisyphus if OPENCODE_SISYPHUS_MODEL is set; otherwise fallback deterministic generator.
+    if os.environ.get("OPENCODE_SISYPHUS_MODEL"):
+        sis = REPO / "scripts" / "run_sisyphus_opencode.py"
+        try:
+            subprocess.run([str(PY), str(sis)], cwd=str(REPO), check=True, env=env)
+        except Exception:
+            # fallback if OpenCode output is invalid or parsing fails
+            subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
+    else:
+        subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
 
     # 3) Run autoloop to test candidates and possibly accept
     subprocess.run([str(PY), str(AUTOLOOP)], cwd=str(REPO), check=True, env=env)

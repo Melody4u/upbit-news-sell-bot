@@ -289,13 +289,28 @@ def save_state(st: dict) -> None:
     STATE.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+ALLOWED_KNOBS = {
+    "rem_exit_on_riskoff",
+    "rem_time_stop_bars",
+    "tp1_ratio",
+    "be_move_mode",
+    "swing_stop_confirm_bars",
+    # keep a few additional safe knobs that exist in simulate signature
+    "tp2_r",
+    "tp1_r",
+    "adx_min",
+}
+
+
 def apply_candidate(preset: dict, cand: dict) -> tuple[dict, str]:
+    # Filter unknown keys to avoid crashing simulate() with unexpected kwargs.
+    safe = {k: v for k, v in (cand or {}).items() if k in ALLOWED_KNOBS}
     p = json.loads(json.dumps(preset))
     sim = dict(p.get("simulate_kwargs", {}) or {})
-    for k, v in cand.items():
+    for k, v in safe.items():
         sim[k] = v
     p["simulate_kwargs"] = sim
-    label = ", ".join([f"{k}={v}" for k, v in cand.items()])
+    label = ", ".join([f"{k}={safe[k]}" for k in sorted(safe.keys())]) if safe else "(filtered_empty)"
     return p, label
 
 
