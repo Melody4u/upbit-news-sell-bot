@@ -405,11 +405,24 @@ def main():
             {"tp1_ratio": 0.4},
         ]
 
+    # Data-quality score (extended): include rem loss + maxR in addition to score_run
+    base_rem0 = float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
+    base_maxr0 = float(base_h2_s.get("pos_r_max", 0.0) or 0.0)
+
+    def score_ext(h2_res: dict, q4_res: dict, h2_summ: dict) -> float:
+        s = float(score_run(h2_res, q4_res))
+        rem = float(h2_summ.get("loss_by_reason", {}).get("rem", 0.0) or 0.0)
+        maxr = float(h2_summ.get("pos_r_max", 0.0) or 0.0)
+        # rem less negative is better; maxR higher is better
+        s += 0.15 * (rem - base_rem0)
+        s += 1.5 * (maxr - base_maxr0)
+        return float(s)
+
     best = None
     best_label = ""
     best_reason = ""
     best_step = current_step
-    best_score = score_run(base_h2, base_q4)
+    best_score = score_ext(base_h2, base_q4, base_h2_s)
 
     max_cands = int(max(0, args.max_candidates))
     if max_cands <= 0:
@@ -431,7 +444,7 @@ def main():
             new[s.name] = {"res": res, "summ": summ}
         runs_backtest += 2
 
-        new_score = score_run(new["H2"]["res"], new["Q4"]["res"])
+        new_score = score_ext(new["H2"]["res"], new["Q4"]["res"], new["H2"]["summ"])  # extended score
         tried.add(label)
 
         step_hit, reason = achieved_step(base, new, current_step)
@@ -619,8 +632,8 @@ def main():
 
     # 5) append run record (for daily report)
     try:
-        base_score = score_run(evidence["baseline"]["H2"]["res"], evidence["baseline"]["Q4"]["res"])
-        new_score = score_run(base["H2"]["res"], base["Q4"]["res"])
+        base_score = score_ext(evidence["baseline"]["H2"]["res"], evidence["baseline"]["Q4"]["res"], evidence["baseline"]["H2"]["summ"])
+        new_score = score_ext(base["H2"]["res"], base["Q4"]["res"], base["H2"]["summ"]) 
     except Exception:
         base_score = 0.0
         new_score = 0.0
