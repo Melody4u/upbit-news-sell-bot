@@ -22,6 +22,8 @@ REPO = Path(__file__).resolve().parents[1]
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 AUTOLOOP = REPO / "scripts" / "arch_autoloop.py"
 GEN_CANDS = REPO / "scripts" / "generate_candidates.py"
+PKG_SIS = REPO / "scripts" / "package_for_sisyphus.py"
+PERSONA = REPO / "scripts" / "persona_advice.py"
 DUMPROOT = REPO / "tmp" / "arch_loop"
 RUNS_LOG = DUMPROOT / "runs.jsonl"
 STATE = DUMPROOT / "state.json"
@@ -98,6 +100,18 @@ def main():
     env = dict(**{**dict(**subprocess.os.environ), "PYTHONIOENCODING": "utf-8"})
     subprocess.run([str(PY), str(AUTOLOOP), "--max-candidates", "0"], cwd=str(REPO), check=True, env=env)
 
+    # 1.5) Confidence check (low-confidence => run personas + build Sisyphus request package)
+    recent = load_runs(now - timedelta(hours=6))
+    last5 = recent[-5:]
+    accept0 = all((not r.get("applied")) for r in last5) if last5 else True
+    step_stuck = all((r.get("step", {}).get("jump", 0) == 0) for r in last5) if last5 else True
+    tiny_delta = all(abs(float(r.get("delta", {}).get("score", 0.0) or 0.0)) < 0.5 for r in last5) if last5 else True
+    confidence = "LOW" if (accept0 and step_stuck and tiny_delta) else "OK"
+
+    if confidence == "LOW":
+        subprocess.run([str(PY), str(PKG_SIS)], cwd=str(REPO), check=True, env=env)
+        subprocess.run([str(PY), str(PERSONA)], cwd=str(REPO), check=True, env=env)
+
     # 2) Generate candidates.json from evidence.json (pipeline proof; later replaced by Sisyphus)
     subprocess.run([str(PY), str(GEN_CANDS)], cwd=str(REPO), check=True, env=env)
 
@@ -151,6 +165,7 @@ def main():
     step = last.get("step", {})
 
     print(f"[{v2}] {now.strftime('%Y-%m-%d %H:%M')} Patchnote (3h)")
+    print(f"- Confidence: {confidence} (LOW면 persona+Sisyphus 패키징 자동 수행)")
     print(f"- Runs: {len(runs)} / backtest {backtests} / patch {patches} / rollback {rollbacks} / accept {len(accepts)}")
     print(f"- Focus: {focus}")
     if step:

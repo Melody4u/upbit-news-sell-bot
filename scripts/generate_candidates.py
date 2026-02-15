@@ -18,6 +18,7 @@ DUMPROOT = REPO / "tmp" / "arch_loop"
 EVIDENCE = DUMPROOT / "evidence.json"
 CANDIDATES = DUMPROOT / "candidates.json"
 STATE = DUMPROOT / "state.json"
+PERSONA = DUMPROOT / "persona.json"
 
 
 def load_json(p: Path) -> dict:
@@ -43,6 +44,10 @@ def main() -> None:
     rem_loss = float((base_h2.get("loss_by_reason") or {}).get("rem", 0.0) or 0.0)
     maxr = float(base_h2.get("pos_r_max", 0.0) or 0.0)
 
+    persona = load_json(PERSONA)
+    wallst = str(persona.get("wallst", ""))
+    crypto = str(persona.get("crypto", ""))
+
     # Core candidate pool (rem tail-risk + right tail)
     pool: list[dict] = []
 
@@ -60,6 +65,14 @@ def main() -> None:
         {"tp1_ratio": 0.4},
         {"tp1_ratio": 0.5},
     ]
+
+    # Persona emphasis tweaks (simple deterministic heuristics)
+    if "time-stop" in wallst.lower() or "time-stop" in crypto.lower():
+        pool.insert(0, {"rem_exit_on_riskoff": True, "rem_time_stop_bars": 168})
+    if "weak_only" in crypto.lower():
+        pool.insert(0, {"be_move_mode": "weak_only"})
+    if "tp1" in crypto.lower():
+        pool.insert(0, {"tp1_ratio": 0.4})
 
     # If rem loss is extreme, prioritize time-stop variations
     if "rem" in focus or rem_loss < -10.0:
