@@ -17,8 +17,8 @@
     "swing_stop_enabled": true,
     "swing_stop_confirm_bars": 3,
     "rem_exit_on_riskoff": true,
-    "rem_time_stop_bars": 240,
-    "tp1_ratio": 0.5,
+    "rem_time_stop_bars": 144,
+    "tp1_ratio": 0.4,
     "be_move_mode": "weak_only"
   }
 }
