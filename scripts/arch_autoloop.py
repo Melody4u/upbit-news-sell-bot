@@ -33,6 +33,7 @@ STATE = DUMPROOT / "state.json"
 EVIDENCE = DUMPROOT / "evidence.json"
 CANDIDATES = DUMPROOT / "candidates.json"
 RUNS_LOG = DUMPROOT / "runs.jsonl"
+POLICY_EVAL = DUMPROOT / "policy_eval.json"
 
 
 @dataclass
@@ -235,9 +236,14 @@ def achieved_step(base: dict, new: dict, current_step: int) -> tuple[int, str]:
     return best, reason
 
 
-def as0_level_hit(anchor: dict, cur: dict) -> tuple[int, str]:
-    """Return (level 0..10, reason) based on H2-only improvements vs anchor."""
-    # anchor/cur expected keys: rem_loss, mdd, maxR
+def as0_level_hit(anchor: dict, cur: dict, cfg: dict | None = None) -> tuple[int, str]:
+    """Return (level 0..10, reason) based on H2-only improvements vs anchor.
+
+    cfg may contain threshold arrays:
+      - rem_steps, mdd_steps, maxr_steps
+    """
+    cfg = cfg or {}
+
     a_rem = float(anchor.get("rem_loss", 0.0) or 0.0)
     a_mdd = float(anchor.get("mdd", 0.0) or 0.0)
     a_maxr = float(anchor.get("maxR", 0.0) or 0.0)
@@ -249,27 +255,25 @@ def as0_level_hit(anchor: dict, cur: dict) -> tuple[int, str]:
     mdd_imp = a_mdd - c_mdd
     maxr_imp = c_maxr - a_maxr
 
-    # Very small steps; can be further subdivided later.
-    rem_steps = [0.3, 0.6, 1.0, 1.6, 2.5, 4.0]
-    mdd_steps = [0.002, 0.004, 0.006, 0.01]
-    maxr_steps = [0.03, 0.06, 0.10]
+    # default steps (very small); can be subdivided dynamically when stuck.
+    rem_steps = list(cfg.get("rem_steps") or [0.3, 0.6, 1.0, 1.6, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0])
+    mdd_steps = list(cfg.get("mdd_steps") or [0.002, 0.004, 0.006, 0.01, 0.015, 0.02])
+    maxr_steps = list(cfg.get("maxr_steps") or [0.03, 0.06, 0.10])
 
     lvl = 0
-    if rem_imp >= rem_steps[0] or mdd_imp >= mdd_steps[0] or maxr_imp >= maxr_steps[0]:
-        lvl = 1
-    if rem_imp >= rem_steps[1] or mdd_imp >= mdd_steps[1] or maxr_imp >= maxr_steps[1]:
-        lvl = 2
-    if rem_imp >= rem_steps[2] or mdd_imp >= mdd_steps[2] or maxr_imp >= maxr_steps[1]:
-        lvl = 3
-    if rem_imp >= rem_steps[3] or mdd_imp >= mdd_steps[3] or maxr_imp >= maxr_steps[2]:
-        lvl = 4
-    if rem_imp >= rem_steps[4] or mdd_imp >= 0.015:
-        lvl = 5
-    if rem_imp >= rem_steps[5] or mdd_imp >= 0.02:
-        lvl = 6
-    # keep 7-10 reserved for future (once we redefine S10=A etc)
+    for t in rem_steps:
+        if rem_imp >= float(t):
+            lvl += 1
+    for t in mdd_steps:
+        if mdd_imp >= float(t):
+            lvl = max(lvl, 1 + mdd_steps.index(t))
+    for t in maxr_steps:
+        if maxr_imp >= float(t):
+            lvl = max(lvl, 1 + maxr_steps.index(t))
+
+    lvl = int(min(10, max(0, lvl)))
     reason = f"AS0 rem_imp={rem_imp:.2f}R mdd_imp={mdd_imp:.3f} maxR_imp={maxr_imp:.2f}"
-    return int(lvl), reason
+    return lvl, reason
 
 
 def load_state() -> dict:
@@ -307,6 +311,9 @@ def main():
     tried = set(state.get("tried_labels", []) or [])
     current_step = int(state.get("accept_step", 0) or 0)
     as0_level = int(state.get("as0_level", 0) or 0)
+    as0_cfg = dict(state.get("as0_cfg", {}) or {})
+    as0_stuck = int(state.get("as0_stuck", 0) or 0)
+    as0_stuck_cycles = int(state.get("as0_stuck_cycles", 5) or 5)
 
     # 1) baseline ladder
     base = {}
@@ -341,6 +348,12 @@ def main():
             "rem_loss": float(base_h2_s.get("loss_by_reason", {}).get("rem", 0.0) or 0.0),
             "mdd": float(base_h2.get("mdd_pct", 0.0) or 0.0),
             "maxR": float(base_h2_s.get("pos_r_max", 0.0) or 0.0),
+        }
+    if "as0_cfg" not in state:
+        state["as0_cfg"] = {
+            "rem_steps": [0.3, 0.6, 1.0, 1.6, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0],
+            "mdd_steps": [0.002, 0.004, 0.006, 0.01, 0.015, 0.02],
+            "maxr_steps": [0.03, 0.06, 0.10]
         }
 
     evidence = {
@@ -430,7 +443,7 @@ def main():
             "mdd": float(new["H2"]["res"].get("mdd_pct", 0.0) or 0.0),
             "maxR": float(new["H2"]["summ"].get("pos_r_max", 0.0) or 0.0),
         }
-        lvl_hit, lvl_reason = as0_level_hit(anchor, cur_h2) if int(current_step) == 0 else (0, "")
+        lvl_hit, lvl_reason = as0_level_hit(anchor, cur_h2, as0_cfg) if int(current_step) == 0 else (0, "")
 
         # Auto-accept policy:
         # - Prefer step progress
@@ -494,12 +507,37 @@ def main():
                 "mdd": float(base_h2.get("mdd_pct", 0.0) or 0.0),
                 "maxR": float(base_h2_s.get("pos_r_max", 0.0) or 0.0),
             }
-            lvl_hit, _ = as0_level_hit(anchor, cur_h2)
+            lvl_hit, _ = as0_level_hit(anchor, cur_h2, as0_cfg)
             state["as0_level"] = int(max(int(as0_level), int(lvl_hit)))
 
         action = f"ACCEPT(S{current_step}->S{best_step}, +{step_jump}): {best_label}"
 
     # 3) persist state + commit accepted preset
+    # AS0 stuck tracking + auto-subdivide (H2-only)
+    if int(current_step) == 0:
+        new_level_now = int(state.get("as0_level", as0_level) or 0)
+        if new_level_now <= int(as0_level):
+            as0_stuck += 1
+        else:
+            as0_stuck = 0
+        state["as0_stuck"] = int(as0_stuck)
+
+        if int(as0_stuck) >= int(as0_stuck_cycles):
+            # subdivide: shrink thresholds by 0.8 to make progress easier
+            cfg = dict(state.get("as0_cfg", {}) or {})
+            rs = [float(x) * 0.8 for x in (cfg.get("rem_steps") or [])]
+            ms = [float(x) * 0.8 for x in (cfg.get("mdd_steps") or [])]
+            xs = [float(x) * 0.8 for x in (cfg.get("maxr_steps") or [])]
+            cfg["rem_steps"] = rs
+            cfg["mdd_steps"] = ms
+            cfg["maxr_steps"] = xs
+            state["as0_cfg"] = cfg
+            state["as0_stuck"] = 0
+            state.setdefault("as0_cfg_history", []).append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "reason": f"stuck>={as0_stuck_cycles}: auto-subdivide thresholds x0.8"
+            })
+
     state["tried_labels"] = sorted(list(tried))[-400:]
     state["last_focus"] = focus
     state["last_evidence"] = str(EVIDENCE)
@@ -515,16 +553,41 @@ def main():
         }
     save_state(state)
 
+    # Policy evaluation (benefit vs risk) — deterministic v0
+    try:
+        base_h2 = evidence["baseline"]["H2"]["res"]
+        base_q4 = evidence["baseline"]["Q4"]["res"]
+        cur_h2 = base["H2"]["res"]
+        cur_q4 = base["Q4"]["res"]
+        base_s = float(score_run(base_h2, base_q4))
+        cur_s = float(score_run(cur_h2, cur_q4))
+        benefit = max(0.0, cur_s - base_s)
+        # risk = q4 deterioration + big mdd
+        q4_drop = float(base_q4.get("return_pct", 0.0) or 0.0) - float(cur_q4.get("return_pct", 0.0) or 0.0)
+        q4_mdd_up = float(cur_q4.get("mdd_pct", 0.0) or 0.0) - float(base_q4.get("mdd_pct", 0.0) or 0.0)
+        risk = max(0.0, q4_drop) + max(0.0, q4_mdd_up * 100.0)
+        policy = {"benefit": benefit, "risk": risk, "delta_score": cur_s - base_s, "q4_drop": q4_drop, "q4_mdd_up": q4_mdd_up}
+        POLICY_EVAL.write_text(json.dumps(policy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        policy = {"benefit": 0.0, "risk": 0.0}
+
     if applied:
-        msg = (
-            f"auto[S{current_step}->S{best_step}]: {best_label} | {best_reason} | "
-            f"H2 {base['H2']['res'].get('return_pct')} mdd {base['H2']['res'].get('mdd_pct')} | "
-            f"Q4 {base['Q4']['res'].get('return_pct')} mdd {base['Q4']['res'].get('mdd_pct')}"
-        )
-        # Only commit preset (tmp/** is gitignored, state stays local)
-        git(["add", str(PRESET)])
-        git(["commit", "-m", msg])
-        git(["push"])
+        # Only proceed if benefit outweighs risk.
+        if float(policy.get("benefit", 0.0)) >= float(policy.get("risk", 0.0)):
+            msg = (
+                f"auto[S{current_step}->S{best_step}]: {best_label} | {best_reason} | "
+                f"H2 {base['H2']['res'].get('return_pct')} mdd {base['H2']['res'].get('mdd_pct')} | "
+                f"Q4 {base['Q4']['res'].get('return_pct')} mdd {base['Q4']['res'].get('mdd_pct')}"
+            )
+            # Only commit preset (tmp/** is gitignored, state stays local)
+            git(["add", str(PRESET)])
+            git(["commit", "-m", msg])
+            git(["push"])
+        else:
+            # reject: rollback preset
+            save_preset(preset0)
+            applied = False
+            action = f"REJECT(policy): benefit<{policy.get('risk',0):.2f} (rollback)"
 
     # 4) story report
     h2r = base["H2"]["res"]
