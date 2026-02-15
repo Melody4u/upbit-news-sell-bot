@@ -117,6 +117,15 @@ def code_snippets() -> dict:
 
 
 def main():
+    # ensure utf-8 console on Windows
+    try:
+        import sys
+
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     ev = load_json(EVIDENCE)
     st = load_json(STATE)
     mode = determine_mode(st)

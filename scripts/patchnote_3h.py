@@ -174,6 +174,15 @@ def main():
     focus = last.get("focus", "n/a")
     step = last.get("step", {})
 
+    # ensure utf-8 console on Windows
+    try:
+        import sys
+
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     print(f"[{v2}] {now.strftime('%Y-%m-%d %H:%M')} Patchnote (3h)")
     print(f"- Confidence: {confidence} (LOW면 persona+Sisyphus 패키징 자동 수행)")
     print(f"- Runs: {len(runs)} / backtest {backtests} / patch {patches} / rollback {rollbacks} / accept {len(accepts)}")
